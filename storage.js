@@ -1,10 +1,10 @@
 /**
  * Token Usage Tracker — storage layer
  *
- * Usage history is persisted in a compact "v2" form to keep settings.json small:
+ * Usage history is persisted in a compact "v3" form to keep settings.json small:
  *
  *   {
- *     v: 2,
+ *     v: 3,
  *     session: {...},                       // unchanged runtime shape
  *     allTime: {...},                       // unchanged runtime shape
  *     models: ["vendor/model:variant"...],  // intern table shared by all buckets
@@ -12,24 +12,28 @@
  *       {
  *         d: "2026-08-30",                  // day key
  *         i, o, n,                          // input, output, message count
- *         c, ci, co,                        // optional: API-reported cost, costed in/out
+ *         cr, cw,                           // optional: cached (read) tokens, cache write tokens
  *         s: [                              // per-model rows:
- *           [modelIdx, in, out, msgCount, cost?, costedIn?, costedOut?]
+ *           [modelIdx, in, out, msgCount, cached?, cacheWrite?]
  *         ]
  *       }
  *     ],
  *     byModel: [                            // all-time per-model aggregates
- *       [modelIdx, in, out, msgCount, cost?, costedIn?, costedOut?]
+ *       [modelIdx, in, out, msgCount, cached?, cacheWrite?]
  *     ]
  *   }
  *
- * The runtime shape is unchanged from v1 (byDay object + byModel object), so all
+ * The runtime shape is unchanged (byDay object + byModel object), so all
  * readers keep working; conversion happens only at the persistence boundary.
  * `byModel` is stored (not derived from days) because historical day rows can
  * contain estimates from the v1 numeric-format migration, while byModel holds
  * the authoritative totals.
+ *
+ * v3 dropped the v2 cost fields (cost/costedInput/costedOutput) and added
+ * cache token tracking.
  */
 
+const V3 = 3;
 const V2 = 2;
 
 export function createEmptyRuntime() {
@@ -41,11 +45,18 @@ export function createEmptyRuntime() {
     };
 }
 
-function bucketHasCost(bucket) {
-    return Number.isFinite(bucket.cost);
+/**
+ * Add cache fields to a deserialized bucket if present in the row.
+ * @param {object} bucket
+ * @param {number|undefined} cached Cache read tokens
+ * @param {number|undefined} cacheWrite Cache write tokens
+ */
+function applyCacheFields(bucket, cached, cacheWrite) {
+    if (Number.isFinite(cached)) bucket.cached = cached;
+    if (Number.isFinite(cacheWrite)) bucket.cacheWrite = cacheWrite;
 }
 
-/** Deserialize one [modelIdx, in, out, msgCount, cost?, ci?, co?] row */
+/** Deserialize one [modelIdx, in, out, msgCount, cached?, cw?] row */
 function rowToBucket(row) {
     const bucket = {
         input: row[1] || 0,
@@ -53,31 +64,25 @@ function rowToBucket(row) {
         total: (row[1] || 0) + (row[2] || 0),
         messageCount: row[3] || 0,
     };
-    if (Number.isFinite(row[4])) {
-        bucket.cost = row[4];
-        bucket.costedInput = row[5] || 0;
-        bucket.costedOutput = row[6] || 0;
-    }
+    applyCacheFields(bucket, row[4], row[5]);
     return bucket;
 }
 
-/** Serialize a runtime bucket to [idx, in, out, msgCount, cost?, ci?, co?] */
+/** Serialize a runtime bucket to [idx, in, out, msgCount, cached?, cw?] */
 function bucketToRow(idx, bucket) {
     const row = [idx, bucket.input || 0, bucket.output || 0, bucket.messageCount || 0];
-    if (bucketHasCost(bucket)) {
-        row.push(bucket.cost, bucket.costedInput || 0, bucket.costedOutput || 0);
-    }
+    if (Number.isFinite(bucket.cached)) row.push(bucket.cached, bucket.cacheWrite || 0);
     return row;
 }
 
 /**
- * Expand compact v2 into the runtime shape.
+ * Expand compact v3 into the runtime shape.
  * @param {object} compact
  * @returns {object} { session, allTime, byDay, byModel }
  */
 export function deserializeUsage(compact) {
     const runtime = createEmptyRuntime();
-    if (!compact || compact.v !== V2 || !Array.isArray(compact.days)) {
+    if (!compact || compact.v !== V3 || !Array.isArray(compact.days)) {
         return runtime;
     }
 
@@ -95,11 +100,7 @@ export function deserializeUsage(compact) {
             messageCount: day.n || 0,
             models: {},
         };
-        if (Number.isFinite(day.c)) {
-            dayData.cost = day.c;
-            dayData.costedInput = day.ci || 0;
-            dayData.costedOutput = day.co || 0;
-        }
+        applyCacheFields(dayData, day.cr, day.cw);
 
         for (const row of (day.s || [])) {
             const modelId = models[row[0]];
@@ -120,9 +121,9 @@ export function deserializeUsage(compact) {
 }
 
 /**
- * Compact the runtime shape into v2 for persistence.
+ * Compact the runtime shape into v3 for persistence.
  * @param {object} runtime { session, allTime, byDay, byModel }
- * @returns {object} compact v2 object (assign this over extension settings)
+ * @returns {object} compact v3 object (assign this over extension settings)
  */
 export function serializeUsage(runtime) {
     const byDay = (runtime && runtime.byDay) || {};
@@ -146,10 +147,9 @@ export function serializeUsage(runtime) {
             o: day.output || 0,
             n: day.messageCount || 0,
         };
-        if (bucketHasCost(day)) {
-            compact.c = day.cost;
-            compact.ci = day.costedInput || 0;
-            compact.co = day.costedOutput || 0;
+        if (Number.isFinite(day.cached)) {
+            compact.cr = day.cached;
+            compact.cw = day.cacheWrite || 0;
         }
 
         compact.s = Object.entries(day.models || {}).map(([modelId, modelData]) =>
@@ -161,7 +161,7 @@ export function serializeUsage(runtime) {
         .map(([modelId, bucket]) => bucketToRow(intern(modelId), bucket));
 
     return {
-        v: V2,
+        v: V3,
         session: runtime.session || createEmptyRuntime().session,
         allTime: runtime.allTime || createEmptyRuntime().allTime,
         models: Array.from(modelIndex.keys()),
@@ -171,68 +171,88 @@ export function serializeUsage(runtime) {
 }
 
 /**
- * One-time conversion from the v1 layout to compact v2.
- * Drops the dead legacy buckets (byHour/byWeek/byMonth/byChat — never written by
- * current code and never displayed) and folds the legacy numeric models format.
- * @param {object} raw v1 usage object (not modified)
- * @returns {object} compact v2 object
+ * One-time conversion from the v1/v2 layouts to compact v3.
+ * Accepts either the v1 runtime layout or the v2 compact layout.
+ * Drops the dead legacy buckets (byHour/byWeek/byMonth/byChat — never written
+ * by current code and never displayed), folds the legacy numeric models format,
+ * and discards cost fields.
+ * @param {object} raw v1 runtime or v2 compact usage object (not modified)
+ * @returns {object} compact v3 object
  */
 export function migrateUsageV1(raw) {
-    const byDay = (raw && raw.byDay) || {};
-    const dayKeys = Object.keys(byDay).sort();
-    const modelIndex = new Map();
+    if (raw && raw.v === V3) return raw;
 
-    const intern = (modelId) => {
-        let idx = modelIndex.get(modelId);
-        if (idx === undefined) {
-            idx = modelIndex.size;
-            modelIndex.set(modelId, idx);
-        }
-        return idx;
-    };
+    if (raw && raw.v === V2) {
+        // v2 compact: expand into the runtime shape first (dropping cost fields)
+        return serializeUsage(deserializeV2(raw));
+    }
 
-    const days = dayKeys.map((dayKey) => {
-        const day = byDay[dayKey];
+    // v1 runtime layout: normalize legacy numeric per-model totals, then compact.
+    const normalized = JSON.parse(JSON.stringify(raw || {}));
+    for (const day of Object.values(normalized.byDay || {})) {
         const dayTotal = day.total || 0;
-        const compact = {
-            d: dayKey,
-            i: day.input || 0,
-            o: day.output || 0,
-            n: day.messageCount || 0,
-        };
-        if (Number.isFinite(day.cost)) {
-            compact.c = day.cost;
-            compact.ci = day.costedInput || 0;
-            compact.co = day.costedOutput || 0;
-        }
-
-        const modelEntries = Object.entries(day.models || {});
-        compact.s = modelEntries.map(([modelId, value]) => {
-            // Legacy format: models[modelId] = totalTokens (number)
-            const bucket = typeof value === 'number'
-                ? {
+        for (const [modelId, value] of Object.entries(day.models || {})) {
+            if (typeof value === 'number') {
+                day.models[modelId] = {
                     input: Math.round((day.input || 0) * (dayTotal ? value / dayTotal : 0)),
                     output: Math.round((day.output || 0) * (dayTotal ? value / dayTotal : 0)),
                     total: value,
                     messageCount: 0,
-                }
-                : value;
-            return bucketToRow(intern(modelId), bucket);
-        });
-        return compact;
-    });
+                };
+            }
+        }
+    }
+    return serializeUsage(normalized);
+}
 
-    const byModelRows = Object.entries((raw && raw.byModel) || {})
-        .map(([modelId, bucket]) => bucketToRow(intern(modelId), bucket || {}));
+/** Expand compact v2 (with cost fields) into the runtime shape, ignoring costs. */
+function deserializeV2(compact) {
+    const runtime = createEmptyRuntime();
+    if (!compact || compact.v !== V2 || !Array.isArray(compact.days)) {
+        return runtime;
+    }
 
-    return {
-        v: V2,
-        session: (raw && raw.session) || createEmptyRuntime().session,
-        allTime: (raw && raw.allTime) || createEmptyRuntime().allTime,
-        models: Array.from(modelIndex.keys()),
-        days,
-        byModel: byModelRows,
-    };
+    runtime.session = { ...createEmptyRuntime().session, ...(compact.session || {}) };
+    runtime.allTime = { ...createEmptyRuntime().allTime, ...(compact.allTime || {}) };
+
+    const models = Array.isArray(compact.models) ? compact.models : [];
+
+    for (const day of compact.days) {
+        if (!day || typeof day.d !== 'string') continue;
+        const dayData = {
+            input: day.i || 0,
+            output: day.o || 0,
+            total: (day.i || 0) + (day.o || 0),
+            messageCount: day.n || 0,
+            models: {},
+        };
+
+        for (const row of (day.s || [])) {
+            const modelId = models[row[0]];
+            if (typeof modelId !== 'string') continue;
+            dayData.models[modelId] = {
+                input: row[1] || 0,
+                output: row[2] || 0,
+                total: (row[1] || 0) + (row[2] || 0),
+                messageCount: row[3] || 0,
+            };
+        }
+
+        runtime.byDay[day.d] = dayData;
+    }
+
+    for (const row of (compact.byModel || [])) {
+        const modelId = models[row[0]];
+        if (typeof modelId !== 'string') continue;
+        runtime.byModel[modelId] = {
+            input: row[1] || 0,
+            output: row[2] || 0,
+            total: (row[1] || 0) + (row[2] || 0),
+            messageCount: row[3] || 0,
+        };
+    }
+
+    return runtime;
 }
 
 function csvEscape(value) {
@@ -246,12 +266,11 @@ function csvEscape(value) {
 /**
  * Build a CSV of the full usage history: one row per day x model.
  * @param {object} runtime { byDay }
- * @param {(bucket: object, modelId: string|null) => number} costFn stored-or-estimated cost
  * @returns {string} CSV text
  */
-export function buildUsageCsv(runtime, costFn) {
+export function buildUsageCsv(runtime) {
     const byDay = (runtime && runtime.byDay) || {};
-    const lines = ['date,model,input_tokens,output_tokens,total_tokens,requests,cost_usd'];
+    const lines = ['date,model,input_tokens,output_tokens,cached_tokens,cache_write_tokens,total_tokens,requests'];
 
     for (const dayKey of Object.keys(byDay).sort()) {
         const day = byDay[dayKey];
@@ -264,15 +283,15 @@ export function buildUsageCsv(runtime, costFn) {
             modelInput += modelData.input || 0;
             modelOutput += modelData.output || 0;
             modelRequests += modelData.messageCount || 0;
-            const cost = Number((costFn ? costFn(modelData, modelId) : 0).toFixed(6));
             lines.push([
                 dayKey,
                 csvEscape(modelId),
                 modelData.input || 0,
                 modelData.output || 0,
+                modelData.cached || 0,
+                modelData.cacheWrite || 0,
                 modelData.total != null ? modelData.total : (modelData.input || 0) + (modelData.output || 0),
                 modelData.messageCount || 0,
-                cost,
             ].join(','));
         }
 
@@ -282,15 +301,15 @@ export function buildUsageCsv(runtime, costFn) {
         const unattributedOutput = (day.output || 0) - modelOutput;
         const unattributedRequests = (day.messageCount || 0) - modelRequests;
         if (unattributedInput > 0 || unattributedOutput > 0 || unattributedRequests > 0) {
-            const cost = Number((costFn ? costFn(day, null) : 0).toFixed(6));
             lines.push([
                 dayKey,
                 '(unattributed)',
                 unattributedInput,
                 unattributedOutput,
+                day.cached || 0,
+                day.cacheWrite || 0,
                 unattributedInput + unattributedOutput,
                 unattributedRequests,
-                cost,
             ].join(','));
         }
     }

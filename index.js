@@ -2,7 +2,10 @@
  * Token Usage Tracker Extension for SillyTavern
  * Tracks input/output token usage across messages with time-based aggregation
  *
- * Uses SillyTavern's native tokenizer system for accurate counting:
+ * Token counting prefers API-reported usage (captured from generate responses,
+ * including cache-read/cache-write tokens — SillyTavern itself discards these)
+ * and falls back to SillyTavern's native tokenizer when the provider reports
+ * no usage:
  * - getTokenCountAsync() for async token counting
  * - Respects user's tokenizer settings (BEST_MATCH, model-specific, etc.)
  */
@@ -13,17 +16,13 @@ import { getTokenCountAsync, getFriendlyTokenizerName } from '../../../tokenizer
 import { SlashCommand } from '../../../slash-commands/SlashCommand.js';
 import { SlashCommandParser } from '../../../slash-commands/SlashCommandParser.js';
 import { getGeneratingModel } from '../../../../script.js';
-import { pricing } from './dict.js';
 import { migrateUsageV1, deserializeUsage, serializeUsage, buildUsageCsv, createEmptyRuntime } from './storage.js';
 
 const extensionName = 'token-usage-tracker';
 
 const defaultSettings = {
-    showInTopBar: true,
     modelColors: {}, // { "gpt-4o": "#6366f1", "claude-3-opus": "#8b5cf6", ... }
-    // Prices per 1M tokens: { "gpt-4o": { in: 2.5, out: 10 }, ... }
-    modelPrices: {},
-    // Accumulated usage data (persisted in compact v2 form via storage.js; byDay/byModel
+    // Accumulated usage data (persisted in compact v3 form via storage.js; byDay/byModel
     // live only in the expanded runtime copy)
     usage: {
         session: { input: 0, output: 0, total: 0, messageCount: 0, startTime: null },
@@ -44,14 +43,13 @@ function loadSettings() {
 
     const settings = extension_settings[extensionName];
     if (!settings.modelColors) settings.modelColors = {};
-    if (!settings.modelPrices) settings.modelPrices = {};
 
-    // Usage is stored in compact v2 form; migrate older layouts once, then expand
+    // Usage is stored in compact v3 form; migrate older layouts once, then expand
     // into the runtime copy. Migration also drops the dead legacy buckets
     // (byHour/byWeek/byMonth/byChat), which current code never writes or displays.
-    if (!settings.usage || settings.usage.v !== 2) {
+    if (!settings.usage || settings.usage.v !== 3) {
         settings.usage = migrateUsageV1(settings.usage || {});
-        console.log('[Token Usage Tracker] Migrated usage data to compact v2 storage format');
+        console.log('[Token Usage Tracker] Migrated usage data to compact v3 storage format');
     }
     usageRuntime = deserializeUsage(settings.usage);
 
@@ -143,24 +141,22 @@ async function countTokens(text) {
  * @param {number} outputTokens - Tokens in the AI response
  * @param {string} [chatId] - Optional chat ID for per-chat tracking
  * @param {string} [modelId] - Optional model ID for per-model tracking
- * @param {{cost?: number|null, source?: string|null, hasTokenCounts?: boolean}} [apiUsage] - Optional API-reported usage metadata
+ * @param {{cached?: number, cacheWrite?: number, hasTokenCounts?: boolean}} [apiUsage] - Optional API-reported usage metadata
  */
 function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null, apiUsage = {}) {
     const usage = usageRuntime;
     const now = new Date();
     const totalTokens = inputTokens + outputTokens;
-    const exactCost = Number.isFinite(apiUsage?.cost) ? apiUsage.cost : null;
+    const cachedTokens = Number.isFinite(apiUsage?.cached) ? Math.max(0, Math.min(apiUsage.cached, inputTokens)) : 0;
+    const cacheWriteTokens = Number.isFinite(apiUsage?.cacheWrite) ? Math.max(0, apiUsage.cacheWrite) : 0;
 
     const addTokens = (bucket) => {
         bucket.input = (bucket.input || 0) + inputTokens;
         bucket.output = (bucket.output || 0) + outputTokens;
         bucket.total = (bucket.total || 0) + totalTokens;
         bucket.messageCount = (bucket.messageCount || 0) + 1;
-        if (exactCost !== null) {
-            bucket.cost = (bucket.cost || 0) + exactCost;
-            bucket.costedInput = (bucket.costedInput || 0) + inputTokens;
-            bucket.costedOutput = (bucket.costedOutput || 0) + outputTokens;
-        }
+        bucket.cached = (bucket.cached || 0) + cachedTokens;
+        bucket.cacheWrite = (bucket.cacheWrite || 0) + cacheWriteTokens;
     };
 
     // Session
@@ -174,7 +170,7 @@ function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null, a
     if (!usage.byDay[dayKey]) usage.byDay[dayKey] = { input: 0, output: 0, total: 0, messageCount: 0, models: {} };
     addTokens(usage.byDay[dayKey]);
 
-    // Track model within day for stacked chart (with input/output breakdown for cost calculation)
+    // Track model within day for stacked chart (with input/output breakdown)
     if (modelId) {
         if (!usage.byDay[dayKey].models) usage.byDay[dayKey].models = {};
         if (!usage.byDay[dayKey].models[modelId]) {
@@ -185,11 +181,8 @@ function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null, a
         modelData.output += outputTokens;
         modelData.total += totalTokens;
         modelData.messageCount = (modelData.messageCount || 0) + 1;
-        if (exactCost !== null) {
-            modelData.cost = (modelData.cost || 0) + exactCost;
-            modelData.costedInput = (modelData.costedInput || 0) + inputTokens;
-            modelData.costedOutput = (modelData.costedOutput || 0) + outputTokens;
-        }
+        modelData.cached = (modelData.cached || 0) + cachedTokens;
+        modelData.cacheWrite = (modelData.cacheWrite || 0) + cacheWriteTokens;
     }
 
     // By model (aggregate)
@@ -203,14 +196,11 @@ function recordUsage(inputTokens, outputTokens, chatId = null, modelId = null, a
     // Emit custom event for UI updates
     eventSource.emit('tokenUsageUpdated', getUsageStats());
 
-    const estimatedCost = exactCost === null ? calculateCost(inputTokens, outputTokens, modelId) : 0;
-    const costLog = exactCost !== null
-        ? `, cost: $${exactCost.toFixed(6)} (reported by API)`
-        : estimatedCost > 0
-            ? `, cost: $${estimatedCost.toFixed(6)} (model pricing)`
-            : '';
+    const cacheLog = cachedTokens > 0
+        ? `, cached: ${cachedTokens}${cacheWriteTokens > 0 ? ` (+${cacheWriteTokens} cache write)` : ''}`
+        : '';
     const countSource = apiUsage?.hasTokenCounts ? 'reported by API' : `counted with ${getFriendlyTokenizerName(main_api).tokenizerName}`;
-    console.log(`[Token Usage Tracker] Recorded: +${inputTokens} input, +${outputTokens} output, model: ${modelId || 'unknown'}${costLog} (${countSource})`);
+    console.log(`[Token Usage Tracker] Recorded: +${inputTokens} input, +${outputTokens} output${cacheLog}, model: ${modelId || 'unknown'} (${countSource})`);
 }
 
 /**
@@ -244,7 +234,7 @@ function resetAllUsage() {
  * Download the full usage history as CSV (one row per day x model)
  */
 function exportUsageCsv() {
-    const csv = buildUsageCsv(usageRuntime, calculateStoredOrEstimatedCost);
+    const csv = buildUsageCsv(usageRuntime);
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
@@ -266,8 +256,8 @@ function getUsageStats() {
     const now = new Date();
     const currentWeekKey = getWeekKey(now);
     const currentMonthKey = getMonthKey(now);
-    const thisWeek = { input: 0, output: 0, total: 0, messageCount: 0 };
-    const thisMonth = { input: 0, output: 0, total: 0, messageCount: 0 };
+    const thisWeek = { input: 0, output: 0, total: 0, messageCount: 0, cached: 0, cacheWrite: 0 };
+    const thisMonth = { input: 0, output: 0, total: 0, messageCount: 0, cached: 0, cacheWrite: 0 };
 
     // Get current tokenizer info for display
     let tokenizerInfo = { tokenizerName: 'Unknown' };
@@ -286,6 +276,8 @@ function getUsageStats() {
             thisWeek.output += data.output || 0;
             thisWeek.total += data.total || 0;
             thisWeek.messageCount += data.messageCount || 0;
+            thisWeek.cached += data.cached || 0;
+            thisWeek.cacheWrite += data.cacheWrite || 0;
         }
 
         if (getMonthKey(date) === currentMonthKey) {
@@ -293,13 +285,15 @@ function getUsageStats() {
             thisMonth.output += data.output || 0;
             thisMonth.total += data.total || 0;
             thisMonth.messageCount += data.messageCount || 0;
+            thisMonth.cached += data.cached || 0;
+            thisMonth.cacheWrite += data.cacheWrite || 0;
         }
     }
 
     return {
         session: { ...usage.session },
         allTime: { ...usage.allTime },
-        today: usage.byDay[getDayKey(now)] || { input: 0, output: 0, total: 0, messageCount: 0, models: {} },
+        today: usage.byDay[getDayKey(now)] || { input: 0, output: 0, total: 0, messageCount: 0, cached: 0, cacheWrite: 0, models: {} },
         thisWeek,
         thisMonth,
         currentChat: null, // Will be populated if context available
@@ -335,9 +329,10 @@ function getUsageForRange(startDate, endDate) {
 }
 
 /**
- * Parses the OpenAI-compatible usage shape returned by Meta Model API.
+ * Parses an OpenAI-compatible usage shape (as stored by some ST forks in
+ * message.extra.api_usage), including cache token details.
  * @param {any} apiUsage
- * @returns {{input: number, output: number, total: number, cost: number|null, source: string, hasTokenCounts: true}|null}
+ * @returns {{input: number, output: number, total: number, cached: number, cacheWrite: number, hasTokenCounts: true}|null}
  */
 function parseApiUsage(apiUsage) {
     if (!apiUsage || typeof apiUsage !== 'object') return null;
@@ -351,11 +346,225 @@ function parseApiUsage(apiUsage) {
         return null;
     }
 
-    const rawCost = apiUsage.cost ?? apiUsage.cost_details?.upstream_inference_cost;
-    const parsedCost = rawCost === null || rawCost === undefined || rawCost === '' ? null : Number(rawCost);
-    const cost = Number.isFinite(parsedCost) && parsedCost >= 0 ? parsedCost : null;
+    const cached = Number(apiUsage.prompt_tokens_details?.cached_tokens ?? apiUsage.cached_tokens ?? 0);
+    const cacheWrite = Number(apiUsage.cache_creation_input_tokens ?? 0);
 
-    return { input, output, total, cost, source: 'api_usage', hasTokenCounts: true };
+    return {
+        input,
+        output,
+        total,
+        cached: Number.isFinite(cached) ? cached : 0,
+        cacheWrite: Number.isFinite(cacheWrite) ? cacheWrite : 0,
+        hasTokenCounts: true,
+    };
+}
+
+// ============================================================
+// API-reported usage capture (including cache tokens)
+// ============================================================
+//
+// SillyTavern's client discards the `usage` objects that providers attach to
+// generation responses (OpenAI `usage`, Anthropic `message.usage`/`message_delta`,
+// Google `usageMetadata`), so caching data never reaches message metadata in
+// vanilla ST. The server does forward responses untouched, though, so we wrap
+// `fetch`, tee the response of generate calls, and parse the usage ourselves.
+
+/** Most recently captured usage for the in-flight generation, if the provider reported one */
+let capturedStreamUsage = null;
+/** Promise that resolves when the active capture reader has consumed its stream */
+let captureReaderDone = null;
+/** True once window.fetch has been wrapped */
+let fetchPatched = false;
+
+const USAGE_ENDPOINTS = [
+    '/api/backends/chat-completions/generate',
+    '/api/backends/text-completions/generate',
+];
+
+/**
+ * Wrap window.fetch so responses to generate requests are teed and parsed
+ * for usage data. The original response is passed through unmodified.
+ */
+function installUsageCapture() {
+    if (fetchPatched || typeof window.fetch !== 'function') return;
+
+    const originalFetch = window.fetch;
+    const patchedFetch = async function (input, init) {
+        const response = await originalFetch.call(window, input, init);
+        try {
+            const url = typeof input === 'string' ? input : (input?.url || '');
+            if (response?.ok && response.body && USAGE_ENDPOINTS.some(ep => url.includes(ep))) {
+                captureUsageFromResponse(response.clone());
+            }
+        } catch (e) {
+            console.error('[Token Usage Tracker] Error capturing usage from response:', e);
+        }
+        return response;
+    };
+    patchedFetch._tokenUsagePatched = true;
+    window.fetch = patchedFetch;
+    fetchPatched = true;
+}
+
+/**
+ * Read a (cloned) generate response and extract any usage objects.
+ * Handles non-streaming JSON bodies and SSE streams.
+ * @param {Response} response
+ */
+function captureUsageFromResponse(response) {
+    captureReaderDone = (async () => {
+        try {
+            const contentType = response.headers?.get('content-type') || '';
+            if (contentType.includes('application/json')) {
+                const data = await response.json();
+                mergeCapturedUsage(extractUsageFromPayload(data));
+                return;
+            }
+
+            // SSE stream: parse `data:` lines as they arrive
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+                let newlineIdx;
+                while ((newlineIdx = buffer.indexOf('\n')) >= 0) {
+                    const line = buffer.slice(0, newlineIdx).trim();
+                    buffer = buffer.slice(newlineIdx + 1);
+                    if (!line.startsWith('data:')) continue;
+                    const payload = line.slice(5).trim();
+                    if (!payload || payload === '[DONE]') continue;
+                    try {
+                        mergeCapturedUsage(extractUsageFromPayload(JSON.parse(payload)));
+                    } catch {
+                        // Incomplete/unrelated chunk — ignore
+                    }
+                }
+            }
+        } catch {
+            // Aborted or unreadable body — keep whatever was captured so far
+        }
+    })();
+}
+
+/**
+ * Extract a normalized usage fragment from a response payload chunk.
+ * Supports OpenAI-compatible `usage`, Anthropic native events, and Google
+ * `usageMetadata`. Anthropic input_tokens excludes cache tokens, so they are
+ * folded into the input count there.
+ * @param {any} data Parsed JSON chunk or body
+ * @returns {{input?: number, output?: number, cached?: number, cacheWrite?: number}|null}
+ */
+function extractUsageFromPayload(data) {
+    if (!data || typeof data !== 'object') return null;
+
+    // Anthropic native streaming events
+    if (data.type === 'message_start' && data.message?.usage) {
+        const u = data.message.usage;
+        const read = Number(u.cache_read_input_tokens ?? 0) || 0;
+        const write = Number(u.cache_creation_input_tokens ?? 0) || 0;
+        const uncached = Number(u.input_tokens ?? 0) || 0;
+        return {
+            input: uncached + read + write,
+            output: Number(u.output_tokens ?? 0) || 0,
+            cached: read,
+            cacheWrite: write,
+        };
+    }
+    if (data.type === 'message_delta' && data.usage) {
+        return { output: Number(data.usage.output_tokens ?? 0) || 0 };
+    }
+
+    // Google Gemini
+    if (data.usageMetadata) {
+        const u = data.usageMetadata;
+        return {
+            input: Number(u.promptTokenCount ?? 0) || 0,
+            output: Number(u.candidatesTokenCount ?? 0) || 0,
+            cached: Number(u.cachedContentTokenCount ?? 0) || 0,
+        };
+    }
+
+    const u = data.usage;
+    if (!u || typeof u !== 'object') return null;
+
+    // OpenAI-compatible (also OpenRouter, DeepSeek, LiteLLM proxies, ...)
+    if (Number.isFinite(u.prompt_tokens) || Number.isFinite(u.completion_tokens)) {
+        return {
+            input: Number(u.prompt_tokens ?? 0) || 0,
+            output: Number(u.completion_tokens ?? 0) || 0,
+            cached: Number(u.prompt_tokens_details?.cached_tokens ?? u.cached_tokens ?? 0) || 0,
+        };
+    }
+
+    // Anthropic-style usage object without an event wrapper
+    if (Number.isFinite(u.input_tokens)) {
+        const read = Number(u.cache_read_input_tokens ?? 0) || 0;
+        const write = Number(u.cache_creation_input_tokens ?? 0) || 0;
+        return {
+            input: (Number(u.input_tokens ?? 0) || 0) + read + write,
+            output: Number(u.output_tokens ?? 0) || 0,
+            cached: read,
+            cacheWrite: write,
+        };
+    }
+
+    return null;
+}
+
+/**
+ * Merge a usage fragment into the pending captured usage.
+ * Later chunks overwrite earlier ones (e.g. Anthropic message_delta output).
+ * @param {{input?: number, output?: number, cached?: number, cacheWrite?: number}|null} fragment
+ */
+function mergeCapturedUsage(fragment) {
+    if (!fragment) return;
+    if (!capturedStreamUsage) capturedStreamUsage = {};
+    for (const key of ['input', 'output', 'cached', 'cacheWrite']) {
+        const value = Number(fragment[key]);
+        if (Number.isFinite(value) && value >= 0) {
+            capturedStreamUsage[key] = value;
+        }
+    }
+}
+
+/**
+ * Reset the pending captured usage at the start of a generation.
+ */
+function resetCapturedUsage() {
+    capturedStreamUsage = null;
+    captureReaderDone = null;
+}
+
+/**
+ * Await the capture reader (briefly) and return the captured usage, if any.
+ * @returns {Promise<{input: number, output: number, cached: number, cacheWrite: number, hasTokenCounts: true}|null>}
+ */
+async function consumeCapturedUsage() {
+    // The usage chunk is the last SSE event, so the reader is normally done by
+    // the time the message events fire. Give it a short grace period just in case.
+    if (captureReaderDone) {
+        await Promise.race([
+            captureReaderDone,
+            new Promise(resolve => setTimeout(resolve, 250)),
+        ]);
+    }
+    const usage = capturedStreamUsage;
+    capturedStreamUsage = null;
+    captureReaderDone = null;
+
+    if (usage && (usage.input > 0 || usage.output > 0)) {
+        return {
+            input: usage.input || 0,
+            output: usage.output || 0,
+            cached: usage.cached || 0,
+            cacheWrite: usage.cacheWrite || 0,
+            hasTokenCounts: true,
+        };
+    }
+    return null;
 }
 
 /**
@@ -364,7 +573,7 @@ function parseApiUsage(apiUsage) {
  * @returns {Object} Zeroed usage
  */
 function getChatUsage() {
-    return { input: 0, output: 0, total: 0, messageCount: 0 };
+    return { input: 0, output: 0, total: 0, messageCount: 0, cached: 0, cacheWrite: 0 };
 }
 
 
@@ -471,6 +680,9 @@ function handleGenerateAfterData(generate_data, dryRun) {
     // Capture model ID synchronously (fast)
     pendingModelId = getGeneratingModel();
 
+    // Fresh capture slot for this generation's API-reported usage
+    resetCapturedUsage();
+
     // Start token counting but DON'T await - let it run in parallel with the API request
     pendingInputTokensPromise = countInputTokens(generate_data)
         .then(count => {
@@ -560,14 +772,14 @@ async function handleMessageReceived(messageIndex, type) {
 
         if (!message || !message.mes) return;
 
-        const apiUsage = parseApiUsage(message.extra?.api_usage);
+        const apiUsage = parseApiUsage(message.extra?.api_usage) || await consumeCapturedUsage();
         let inputTokens;
         let outputTokens;
 
         if (apiUsage) {
             inputTokens = apiUsage.input;
             outputTokens = apiUsage.output;
-            console.log(`[Token Usage Tracker] Using API-reported usage: ${inputTokens} in, ${outputTokens} out${apiUsage.cost !== null ? `, $${apiUsage.cost.toFixed(6)}` : ''}`);
+            console.log(`[Token Usage Tracker] Using API-reported usage: ${inputTokens} in, ${outputTokens} out, ${apiUsage.cached || 0} cached`);
         } else {
             // Use SillyTavern's pre-calculated token count if available.
             // This already includes reasoning tokens when power_user.message_token_count_enabled is true.
@@ -632,6 +844,9 @@ async function handleGenerationStopped() {
     if (!pendingInputTokensPromise) return;
 
     try {
+        // Prefer API-reported usage (some providers still report usage when aborted)
+        const captured = await consumeCapturedUsage();
+
         let outputTokens = 0;
 
         // Try to get partial output from the streaming processor
@@ -651,18 +866,23 @@ async function handleGenerationStopped() {
         }
 
         // Await the input token counting that was started in handleGenerateAfterData
-        const inputTokens = await pendingInputTokensPromise;
+        let inputTokens = await pendingInputTokensPromise;
         const modelId = pendingModelId;
         pendingInputTokensPromise = null;
         pendingModelId = null;
         preContinueTokenCount = 0; // Reset continue state too
+
+        if (captured) {
+            inputTokens = captured.input;
+            outputTokens = captured.output || outputTokens;
+        }
 
         // Get current chat ID if available
         const context = getContext();
         const chatId = context.chatMetadata?.chat_id || null;
 
         // Record the usage - input tokens were sent even if generation was stopped
-        recordUsage(inputTokens, outputTokens, chatId, modelId);
+        recordUsage(inputTokens, outputTokens, chatId, modelId, captured);
 
         console.log(`[Token Usage Tracker] Recorded stopped generation: ${inputTokens} in, ${outputTokens} out (partial), model: ${modelId || 'unknown'}`);
     } catch (error) {
@@ -683,6 +903,7 @@ function handleChatChanged(chatId) {
     preContinueTokenCount = 0;
     isQuietGeneration = false;
     isImpersonateGeneration = false;
+    resetCapturedUsage();
     console.log(`[Token Usage Tracker] Chat changed to: ${chatId}`);
     eventSource.emit('tokenUsageUpdated', getUsageStats());
 }
@@ -696,9 +917,8 @@ async function handleImpersonateReady(text) {
     if (!pendingInputTokensPromise) return;
 
     try {
-
         // Await the input token counting that was started in handleGenerateAfterData
-        const inputTokens = await pendingInputTokensPromise;
+        let inputTokens = await pendingInputTokensPromise;
         const modelId = pendingModelId;
         pendingInputTokensPromise = null;
         pendingModelId = null;
@@ -709,11 +929,18 @@ async function handleImpersonateReady(text) {
             outputTokens = await countTokens(text);
         }
 
+        // Prefer API-reported usage
+        const captured = await consumeCapturedUsage();
+        if (captured) {
+            inputTokens = captured.input;
+            outputTokens = captured.output || outputTokens;
+        }
+
         // Get current chat ID if available
         const context = getContext();
         const chatId = context.chatMetadata?.chat_id || null;
 
-        recordUsage(inputTokens, outputTokens, chatId, modelId);
+        recordUsage(inputTokens, outputTokens, chatId, modelId, captured);
 
 
         // Reset impersonate state
@@ -733,11 +960,11 @@ function registerSlashCommands() {
             const stats = getUsageStats();
             const output = [
                 `Tokenizer: ${stats.tokenizer}`,
-                `Session: ${stats.session.total} tokens (${stats.session.input} in, ${stats.session.output} out)`,
-                `Today: ${stats.today.total} tokens`,
-                `This Week: ${stats.thisWeek.total} tokens`,
-                `This Month: ${stats.thisMonth.total} tokens`,
-                `All Time: ${stats.allTime.total} tokens`,
+                `Session: ${stats.session.total} tokens (${stats.session.input} in, ${stats.session.output} out, ${stats.session.cached || 0} cached)`,
+                `Today: ${stats.today.total} tokens (${stats.today.cached || 0} cached)`,
+                `This Week: ${stats.thisWeek.total} tokens (${stats.thisWeek.cached || 0} cached)`,
+                `This Month: ${stats.thisMonth.total} tokens (${stats.thisMonth.cached || 0} cached)`,
+                `All Time: ${stats.allTime.total} tokens (${stats.allTime.cached || 0} cached)`,
             ].join('\n');
             return output;
         },
@@ -797,416 +1024,6 @@ function formatTokens(count) {
  */
 function formatNumberFull(num) {
     return new Intl.NumberFormat('en-US').format(num);
-}
-
-/**
- * Normalize model IDs for compatibility matching.
- * Handles case and punctuation variants while preserving semantic version differences.
- * @param {string} modelId
- * @returns {string}
- */
-function normalizeModelIdForLookup(modelId) {
-    if (!modelId) return '';
-
-    let normalized = String(modelId).trim().toLowerCase();
-
-    // Strip live-stat suffixes (" | 14:12 | ...") and normalize version delimiters.
-    normalized = normalized.split('|')[0].trim();
-    normalized = normalized.replace(/(\d)[\s._/-]+(?=\d)/g, '$1');
-
-    // Split words and numbers for IDs like "qwen3.6-plus" vs "Qwen 3.6 Plus".
-    normalized = normalized.replace(/([a-z])(\d)/g, '$1 $2');
-    normalized = normalized.replace(/(\d)([a-z])/g, '$1 $2');
-
-    normalized = normalized.replace(/[:/]+/g, ' ');
-    normalized = normalized.replace(/[\s._-]+/g, ' ');
-    normalized = normalized.replace(/\s+/g, ' ').trim();
-
-    return normalized;
-}
-
-/**
- * Build candidate lookup forms for model ID matching.
- * @param {string} modelId
- * @returns {string[]}
- */
-function getModelLookupCandidates(modelId) {
-    const raw = String(modelId || '').trim();
-    if (!raw) return [];
-
-    const candidates = new Set();
-    const suffixPattern = /(?:[\s._:-]+)(?:it|instruct|chat|agentic|free)$/i;
-    const addCandidate = (value) => {
-        const trimmed = String(value || '').trim();
-        if (!trimmed) return;
-        candidates.add(trimmed);
-
-        // Add progressively stripped terminal tags ("-it", ":free", "-thinking", etc).
-        let variant = trimmed;
-        while (true) {
-            const stripped = variant.replace(suffixPattern, '').trim();
-            if (!stripped || stripped === variant) break;
-            candidates.add(stripped);
-            variant = stripped;
-        }
-    };
-
-    addCandidate(raw);
-    const beforePipe = raw.split('|')[0].trim();
-    addCandidate(beforePipe);
-
-    if (beforePipe.includes('/')) {
-        const tail = beforePipe.split('/').filter(Boolean).pop();
-        addCandidate(tail);
-    }
-
-    if (beforePipe.includes(':')) {
-        const tail = beforePipe.split(':').filter(Boolean).pop();
-        addCandidate(tail);
-    }
-
-    const withoutParens = beforePipe.replace(/\([^)]*\)/g, '').trim();
-    addCandidate(withoutParens);
-
-    return [...candidates];
-}
-
-/**
- * Build normalized lookup map for a pricing dictionary.
- * @param {Record<string, {in: number, out: number}>} priceMap
- * @returns {Map<string, string>}
- */
-function buildNormalizedPriceLookupMap(priceMap) {
-    const normalizedMap = new Map();
-    const getPriority = (key) => /:free$/i.test(key) ? 0 : 1;
-    for (const key of Object.keys(priceMap || {})) {
-        const candidates = getModelLookupCandidates(key);
-        for (const candidate of candidates) {
-            const normalized = normalizeModelIdForLookup(candidate);
-            if (!normalized) continue;
-
-            if (!normalizedMap.has(normalized)) {
-                normalizedMap.set(normalized, key);
-                continue;
-            }
-
-            const existingKey = normalizedMap.get(normalized);
-            if (existingKey && getPriority(key) > getPriority(existingKey)) {
-                normalizedMap.set(normalized, key);
-            }
-        }
-    }
-    return normalizedMap;
-}
-
-const LOOKUP_STOPWORDS = new Set([
-    'it', 'instruct', 'chat', 'thinking', 'reasoning', 'agentic', 'free',
-    'preview', 'customtools', 'customtool', 'tools', 'tool', 'gguf', 'ud',
-]);
-
-const LOOKUP_QUALIFIERS = new Set([
-    'preview', 'customtools', 'customtool', 'thinking', 'reasoning', 'agentic',
-    'image', 'vision', 'audio', 'search', 'fast', 'lite', 'mini', 'beta', 'exp',
-]);
-
-const LOOKUP_TOKEN_SYNONYMS = {
-    expert: 'pro',
-};
-
-function tokenizeModelIdForLookup(modelId) {
-    let value = String(modelId || '').toLowerCase();
-    value = value.split('|')[0].trim();
-    value = value.replace(/([a-z])(\d)/g, '$1 $2');
-    value = value.replace(/(\d)([a-z])/g, '$1 $2');
-    value = value.replace(/[^\w]+/g, ' ');
-    const tokens = value.split(/\s+/).filter(Boolean);
-
-    const result = [];
-    for (const tokenRaw of tokens) {
-        let token = tokenRaw.toLowerCase();
-        if (/^\d{5,}$/.test(token)) continue; // date/build identifiers
-        if (/^iq\d+[a-z]*$/.test(token)) continue; // quantization labels
-        if (LOOKUP_STOPWORDS.has(token)) continue;
-        token = LOOKUP_TOKEN_SYNONYMS[token] || token;
-        if (!token || LOOKUP_STOPWORDS.has(token)) continue;
-        if (token.length <= 1) continue;
-        result.push(token);
-    }
-
-    return [...new Set(result)];
-}
-
-function extractVersionInfo(modelId) {
-    const composite = new Set();
-    const major = new Set();
-    let value = String(modelId || '').toLowerCase();
-    value = value.replace(/([a-z])(\d)/g, '$1 $2');
-    value = value.replace(/(\d)([a-z])/g, '$1 $2');
-
-    const compositeRegex = /(^|[^0-9])(\d+(?:[._-]\d+)+)(?=$|[^0-9])/g;
-    let match;
-    while ((match = compositeRegex.exec(value)) !== null) {
-        const raw = match[2];
-        const parts = raw.split(/[._-]+/).filter(Boolean);
-        if (parts.length < 2) continue;
-        while (parts.length > 2 && parts[parts.length - 1].length >= 4) {
-            parts.pop();
-        }
-        if (parts.length < 2) continue;
-        if (parts.slice(0, 2).some(p => p.length >= 4)) continue; // likely date-only token chain
-        const majorPart = String(Number.parseInt(parts[0], 10));
-        const minorPart = String(Number.parseInt(parts[1], 10));
-        if (!Number.isFinite(Number(majorPart)) || !Number.isFinite(Number(minorPart))) continue;
-        composite.add(`${majorPart}.${minorPart}`);
-        major.add(majorPart);
-    }
-
-    const majorRegex = /(^|[^0-9a-z])(\d{1,2})(?=$|[^0-9a-z])/g;
-    while ((match = majorRegex.exec(value)) !== null) {
-        const part = String(Number.parseInt(match[2], 10));
-        if (Number.isFinite(Number(part))) {
-            major.add(part);
-        }
-    }
-
-    return { composite, major };
-}
-
-function extractLookupQualifiers(modelId) {
-    let value = String(modelId || '').toLowerCase();
-    value = value.split('|')[0].trim();
-    value = value.replace(/([a-z])(\d)/g, '$1 $2');
-    value = value.replace(/(\d)([a-z])/g, '$1 $2');
-    value = value.replace(/[^\w]+/g, ' ');
-    const qualifiers = new Set();
-    for (const token of value.split(/\s+/).filter(Boolean)) {
-        if (LOOKUP_QUALIFIERS.has(token)) {
-            qualifiers.add(token);
-        }
-    }
-    return qualifiers;
-}
-
-function getMaxCompositeVersion(composites) {
-    let max = 0;
-    for (const composite of composites) {
-        const [majorPart, minorPart] = composite.split('.');
-        const major = Number.parseInt(majorPart, 10);
-        const minor = Number.parseInt(minorPart, 10);
-        if (!Number.isFinite(major) || !Number.isFinite(minor)) continue;
-        const rank = (major * 1000) + minor;
-        if (rank > max) max = rank;
-    }
-    return max;
-}
-
-function buildLookupProfile(modelId) {
-    const tokenList = tokenizeModelIdForLookup(modelId);
-    const tokenSet = new Set(tokenList);
-    const version = extractVersionInfo(modelId);
-    const qualifiers = extractLookupQualifiers(modelId);
-    const source = String(modelId || '').toLowerCase();
-    const vendor = source.includes('/') ? source.split('/')[0] : '';
-    return {
-        modelId,
-        tokenList,
-        tokenSet,
-        vendor,
-        qualifiers,
-        compositeVersions: version.composite,
-        majorVersions: version.major,
-        maxCompositeVersion: getMaxCompositeVersion(version.composite),
-        isFree: /:free$/i.test(modelId),
-    };
-}
-
-function hasIntersection(a, b) {
-    for (const value of a) {
-        if (b.has(value)) return true;
-    }
-    return false;
-}
-
-function semanticMatchScore(queryProfile, targetProfile) {
-    const querySize = queryProfile.tokenList.length;
-    if (querySize === 0) return Number.NEGATIVE_INFINITY;
-
-    let common = 0;
-    for (const token of queryProfile.tokenList) {
-        if (targetProfile.tokenSet.has(token)) common++;
-    }
-    if (common === 0) return Number.NEGATIVE_INFINITY;
-    if (querySize > 1 && common < 2) return Number.NEGATIVE_INFINITY;
-
-    const precision = common / querySize;
-    if (precision < 0.5) return Number.NEGATIVE_INFINITY;
-
-    let versionPenalty = 0;
-    if (queryProfile.compositeVersions.size > 0) {
-        if (targetProfile.compositeVersions.size > 0) {
-            if (!hasIntersection(queryProfile.compositeVersions, targetProfile.compositeVersions)) {
-                return Number.NEGATIVE_INFINITY;
-            }
-        } else if (hasIntersection(queryProfile.majorVersions, targetProfile.majorVersions)) {
-            versionPenalty += 3;
-        } else {
-            return Number.NEGATIVE_INFINITY;
-        }
-    } else if (queryProfile.majorVersions.size > 0) {
-        if (!hasIntersection(queryProfile.majorVersions, targetProfile.majorVersions)) {
-            return Number.NEGATIVE_INFINITY;
-        }
-    }
-
-    let score = (common * 10) + (precision * 5) - (targetProfile.tokenList.length - common);
-    if (queryProfile.vendor && targetProfile.vendor && queryProfile.vendor === targetProfile.vendor) {
-        score += 2;
-    }
-    let qualifierPenalty = 0;
-    for (const qualifier of targetProfile.qualifiers) {
-        if (!queryProfile.qualifiers.has(qualifier)) {
-            qualifierPenalty += 1;
-        }
-    }
-    for (const qualifier of queryProfile.qualifiers) {
-        if (!targetProfile.qualifiers.has(qualifier)) {
-            qualifierPenalty += 5;
-        } else {
-            score += 2;
-        }
-    }
-    score -= versionPenalty;
-    score -= qualifierPenalty * 2;
-    if (targetProfile.isFree) {
-        score -= 1;
-    }
-    score += targetProfile.maxCompositeVersion / 1000000;
-    return score;
-}
-
-function resolveSemanticPriceMatch(lookupCandidates, priceProfiles = openRouterPriceProfiles) {
-    let best = null;
-
-    for (const candidate of lookupCandidates) {
-        const queryProfile = buildLookupProfile(candidate);
-        for (const targetProfile of priceProfiles) {
-            const score = semanticMatchScore(queryProfile, targetProfile);
-            if (!Number.isFinite(score)) continue;
-
-            const scored = { score, key: targetProfile.modelId };
-            if (!best) {
-                best = scored;
-                continue;
-            }
-
-            if (score > best.score) {
-                best = scored;
-                continue;
-            }
-
-            if (score === best.score && scored.key.localeCompare(best.key) < 0) {
-                best = scored;
-            }
-        }
-    }
-
-    if (!best) return null;
-    return best.key;
-}
-
-const openRouterNormalizedPriceLookupMap = buildNormalizedPriceLookupMap(pricing);
-const openRouterPriceProfiles = Object.keys(pricing).map(buildLookupProfile);
-let manualNormalizedPriceLookupMap = null;
-let manualPriceProfiles = null;
-
-/**
- * Sanitize and validate a price object.
- * @param {any} price
- * @returns {{in: number, out: number}|null}
- */
-function parsePriceObject(price) {
-    if (!price || typeof price !== 'object') return null;
-    const input = Number.parseFloat(price.in);
-    const output = Number.parseFloat(price.out);
-    if (!Number.isFinite(input) || !Number.isFinite(output) || input < 0 || output < 0) {
-        return null;
-    }
-    return { in: input, out: output };
-}
-
-/**
- * Resolve model price using exact + normalized matching with manual override priority.
- * @param {string} modelId
- * @returns {{resolved: boolean, in: number|null, out: number|null, source: string|null, matchedModelId: string|null}}
- */
-function resolveModelPrice(modelId) {
-    const settings = getSettings();
-    const manualPrices = settings.modelPrices || {};
-    const lookupCandidates = getModelLookupCandidates(modelId);
-    if (!manualNormalizedPriceLookupMap) {
-        manualNormalizedPriceLookupMap = buildNormalizedPriceLookupMap(manualPrices);
-        manualPriceProfiles = Object.keys(manualPrices).map(buildLookupProfile);
-    }
-
-    // 1) Manual exact
-    if (Object.prototype.hasOwnProperty.call(manualPrices, modelId)) {
-        const parsed = parsePriceObject(manualPrices[modelId]);
-        if (parsed) {
-            return { resolved: true, ...parsed, source: 'manual-exact', matchedModelId: modelId };
-        }
-    }
-
-    // 2) Manual normalized
-    for (const candidate of lookupCandidates) {
-        const normalized = normalizeModelIdForLookup(candidate);
-        const matched = manualNormalizedPriceLookupMap.get(normalized);
-        if (matched) {
-            const parsed = parsePriceObject(manualPrices[matched]);
-            if (parsed) {
-                return { resolved: true, ...parsed, source: 'manual-normalized', matchedModelId: matched };
-            }
-        }
-    }
-
-    // 3) Manual semantic
-    const manualSemanticMatch = resolveSemanticPriceMatch(lookupCandidates, manualPriceProfiles || []);
-    if (manualSemanticMatch && Object.prototype.hasOwnProperty.call(manualPrices, manualSemanticMatch)) {
-        const parsed = parsePriceObject(manualPrices[manualSemanticMatch]);
-        if (parsed) {
-            return { resolved: true, ...parsed, source: 'manual-semantic', matchedModelId: manualSemanticMatch };
-        }
-    }
-
-    // 4) Built-in exact
-    if (Object.prototype.hasOwnProperty.call(pricing, modelId)) {
-        const parsed = parsePriceObject(pricing[modelId]);
-        if (parsed) {
-            return { resolved: true, ...parsed, source: 'openrouter-exact', matchedModelId: modelId };
-        }
-    }
-
-    // 5) Built-in normalized
-    for (const candidate of lookupCandidates) {
-        const normalized = normalizeModelIdForLookup(candidate);
-        const matched = openRouterNormalizedPriceLookupMap.get(normalized);
-        if (matched) {
-            const parsed = parsePriceObject(pricing[matched]);
-            if (parsed) {
-                return { resolved: true, ...parsed, source: 'openrouter-normalized', matchedModelId: matched };
-            }
-        }
-    }
-
-    // 6) Semantic fallback (token/version aware)
-    const semanticMatch = resolveSemanticPriceMatch(lookupCandidates);
-    if (semanticMatch && Object.prototype.hasOwnProperty.call(pricing, semanticMatch)) {
-        const parsed = parsePriceObject(pricing[semanticMatch]);
-        if (parsed) {
-            return { resolved: true, ...parsed, source: 'openrouter-semantic', matchedModelId: semanticMatch };
-        }
-    }
-
-    return { resolved: false, in: null, out: null, source: null, matchedModelId: null };
 }
 
 /**
@@ -1285,132 +1102,30 @@ function colorDistance(c1, c2) {
     return Math.sqrt((r1 - r2) ** 2 + (g1 - g2) ** 2 + (b1 - b2) ** 2);
 }
 
-/**
- * Set color for a model
- * @param {string} modelId - Model identifier
- * @param {string} color - Hex color code
- */
-function setModelColor(modelId, color) {
-    const settings = getSettings();
-    settings.modelColors[modelId] = color;
-    saveSettings();
-}
-
-/**
- * Get price settings for a model
- * @param {string} modelId
- * @returns {{in: number|null, out: number|null, resolved: boolean, source: string|null, matchedModelId: string|null}}
- */
-function getModelPrice(modelId) {
-    return resolveModelPrice(modelId);
-}
-
-/**
- * Set price settings for a model
- * @param {string} modelId
- * @param {number} priceIn - Price per 1M input tokens
- * @param {number} priceOut - Price per 1M output tokens
- */
-function setModelPrice(modelId, priceIn, priceOut) {
-    const settings = getSettings();
-    const normalizePrice = (value) => {
-        const parsed = Number.parseFloat(value);
-        if (!Number.isFinite(parsed) || parsed <= 0) return 0;
-        return parsed < 0.001 ? 0.001 : parsed;
-    };
-    settings.modelPrices[modelId] = {
-        in: normalizePrice(priceIn),
-        out: normalizePrice(priceOut),
-    };
-    manualNormalizedPriceLookupMap = null;
-    manualPriceProfiles = null;
-    saveSettings();
-}
-
-/**
- * Calculate cost for a given token usage and model
- * @param {number} inputTokens
- * @param {number} outputTokens
- * @param {string} modelId
- * @returns {number} Cost in dollars
- */
-function calculateCost(inputTokens, outputTokens, modelId) {
-    if ((inputTokens || 0) <= 0 && (outputTokens || 0) <= 0) return 0;
-
-    const prices = resolveModelPrice(modelId);
-    if (!prices.resolved || prices.in === null || prices.out === null) return 0;
-
-    const inputCost = (inputTokens / 1000000) * prices.in;
-    const outputCost = (outputTokens / 1000000) * prices.out;
-    return inputCost + outputCost;
-}
-
-function calculateStoredOrEstimatedCost(data, modelId) {
-    if (!data) return 0;
-
-    const exactCost = Number.isFinite(data.cost) ? data.cost : 0;
-    const residualInput = Math.max(0, (data.input || 0) - (data.costedInput || 0));
-    const residualOutput = Math.max(0, (data.output || 0) - (data.costedOutput || 0));
-    return exactCost + calculateCost(residualInput, residualOutput, modelId);
-}
-
-function formatCost(cost) {
-    const value = Number(cost) || 0;
-    if (value > 0 && value < 0.01) return '<$0.01';
-    return `$${value.toFixed(2)}`;
-}
-
-function formatPricePerMillion(price) {    const value = Number(price);
-    if (!Number.isFinite(value) || value < 0) return null;
-    if (value === 0) return '$0/1M';
-    if (value >= 100) return `$${value.toFixed(0)}/1M`;
-    if (value >= 10) return `$${value.toFixed(1)}/1M`;
-    if (value >= 1) return `$${value.toFixed(2)}/1M`;
-    if (value >= 0.01) return `$${value.toFixed(3).replace(/\.?0+$/, '')}/1M`;
-    return `$${value.toFixed(4).replace(/\.?0+$/, '')}/1M`;
-}
-
-function renderInputOutputRows(prefix, input, output, requests, valueFontSize = '14px') {
+function renderInputOutputRows(prefix, input, output, cached, requests, valueFontSize = '14px') {
     return `
-        <div style="display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px 10px; color: var(--SmartThemeBodyColor);">
+        <div style="display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px 10px; color: var(--SmartThemeBodyColor);">
             <div style="font-size: 10px; opacity: 0.75;">In</div>
             <div style="font-size: 10px; opacity: 0.75;">Out</div>
+            <div style="font-size: 10px; opacity: 0.75;" title="Cache-read tokens (subset of In)">Cached</div>
             <div style="font-size: 10px; opacity: 0.75;">Requests</div>
             <div id="token-usage-${prefix}-in" style="font-size: ${valueFontSize}; font-weight: 600; color: var(--SmartThemeBodyColor);">${formatNumberFull(input || 0)}</div>
             <div id="token-usage-${prefix}-out" style="font-size: ${valueFontSize}; font-weight: 600; color: var(--SmartThemeBodyColor);">${formatNumberFull(output || 0)}</div>
+            <div id="token-usage-${prefix}-cached" style="font-size: ${valueFontSize}; font-weight: 600; color: var(--SmartThemeBodyColor);">${formatNumberFull(cached || 0)}</div>
             <div id="token-usage-${prefix}-requests" style="font-size: ${valueFontSize}; font-weight: 600; color: var(--SmartThemeBodyColor);">${formatNumberFull(requests || 0)}</div>
         </div>
     `;
 }
 
-function renderUsageStatCard(title, prefix, data, cost = '$0.00') {
+function renderUsageStatCard(title, prefix, data) {
     return `
-        <div class="token-usage-stat-card" style="background: var(--SmartThemeInputColor); border-radius: 6px; border: 1px solid var(--SmartThemeBorderColor); overflow: hidden; display: flex;">
-            <div style="flex: 1; padding: 6px 8px;">
+        <div class="token-usage-stat-card" style="background: var(--SmartThemeInputColor); border-radius: 6px; border: 1px solid var(--SmartThemeBorderColor); overflow: hidden;">
+            <div style="padding: 6px 8px;">
                 <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.5; margin-bottom: 4px;">${title}</div>
-                ${renderInputOutputRows(prefix, data.input, data.output, data.messageCount)}
-            </div>
-            <div style="width: 1px; background: var(--SmartThemeBorderColor);"></div>
-            <div style="flex: 0 0 78px; padding: 6px 8px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px;">
-                <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.5;">Cost</div>
-                <span style="font-size: 14px; font-weight: 600; color: var(--SmartThemeBodyColor);" id="token-usage-${prefix}-cost">${cost}</span>
+                ${renderInputOutputRows(prefix, data.input, data.output, data.cached, data.messageCount)}
             </div>
         </div>
     `;
-}
-
-/**
- * Calculate all-time cost using the byModel aggregation which has precise input/output counts
- */
-function calculateAllTimeCost() {
-    const byModel = usageRuntime.byModel;
-    let total = 0;
-
-    for (const [modelId, data] of Object.entries(byModel)) {
-        const cost = calculateStoredOrEstimatedCost(data, modelId);
-        total += cost || 0;
-    }
-    return total;
 }
 
 // Chart state
@@ -1457,6 +1172,7 @@ function getChartData(days) {
             usage: dayData.total || 0,
             input: dayData.input || 0,
             output: dayData.output || 0,
+            cached: dayData.cached || 0,
             messageCount: dayData.messageCount || 0,
             models: dayData.models || {},
             displayDate: new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric' }).format(date),
@@ -1680,13 +1396,6 @@ function renderChart() {
 function showTooltip(d) {
     if (!tooltip) return;
 
-    let tooltipCost = 0;
-    if (d.models && Object.keys(d.models).length > 0) {
-        for (const [modelId, modelData] of Object.entries(d.models)) {
-            tooltipCost += calculateStoredOrEstimatedCost(modelData, modelId) || 0;
-        }
-    }
-
     // Build model breakdown HTML
     let modelBreakdown = '';
     if (d.models && Object.keys(d.models).length > 0) {
@@ -1697,9 +1406,10 @@ function showTooltip(d) {
 
             const input = Number(value?.input) || 0;
             const output = Number(value?.output) || 0;
+            const cached = Number(value?.cached) || 0;
             const total = Number(value?.total) || (input + output);
             const messageCount = Number(value?.messageCount);
-            return { total, input, output, messageCount: Number.isFinite(messageCount) ? messageCount : null };
+            return { total, input, output, cached, messageCount: Number.isFinite(messageCount) ? messageCount : null };
         };
 
         const modelEntries = Object.entries(d.models).sort((a, b) => getModelTokenBreakdown(a[1]).total - getModelTokenBreakdown(b[1]).total); // Sort ascending (smallest first, like graph bottom-up)
@@ -1710,14 +1420,14 @@ function showTooltip(d) {
             modelBreakdown += `<div style="font-size: 9px; color: rgba(255,255,255,0.3); margin-bottom: 2px;">+${hiddenEntryCount} more</div>`;
         }
         for (const [model, modelData] of displayEntries) {
-            const { total, input, output, messageCount } = getModelTokenBreakdown(modelData);
+            const { total, input, output, cached, messageCount } = getModelTokenBreakdown(modelData);
             const percent = d.usage > 0 ? Math.round((total / d.usage) * 100) : 0;
             const shortName = model.length > 25 ? model.substring(0, 22) + '...' : model;
             const color = getModelColor(model);
             const breakdownLines = input !== null && output !== null
                 ? `
                     <div style="margin-top: 0; margin-left: 12px; color: rgba(255,255,255,0.65); line-height: 1.15; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">
-                        ${formatNumberFull(input)} | ${formatNumberFull(output)}${messageCount !== null ? ` | ${formatNumberFull(messageCount)}` : ''}
+                        ${formatNumberFull(input)} | ${formatNumberFull(output)} | ${formatNumberFull(cached)} cached${messageCount !== null ? ` | ${formatNumberFull(messageCount)}` : ''}
                     </div>
                 `
                 : `
@@ -1741,14 +1451,15 @@ function showTooltip(d) {
     }
 
     tooltip.innerHTML = `
-        <div style="font-weight: 600; margin-bottom: 2px; color: var(--SmartThemeBodyColor);">${d.fullDate}</div>
-        <div style="font-size: 12px; font-weight: 600; color: var(--SmartThemeBodyColor); margin-bottom: 4px;">${formatCost(tooltipCost)}</div>
-        <div style="display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px 10px; font-size: 10px; color: var(--SmartThemeBodyColor); margin-bottom: 2px;">
+        <div style="font-weight: 600; margin-bottom: 4px; color: var(--SmartThemeBodyColor);">${d.fullDate}</div>
+        <div style="display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px 10px; font-size: 10px; color: var(--SmartThemeBodyColor); margin-bottom: 2px;">
             <div style="opacity: 0.6;">In</div>
             <div style="opacity: 0.6;">Out</div>
+            <div style="opacity: 0.6;">Cached</div>
             <div style="opacity: 0.6;">Requests</div>
             <div style="font-size: 11px; font-weight: 600; opacity: 1;">${formatNumberFull(d.input)}</div>
             <div style="font-size: 11px; font-weight: 600; opacity: 1;">${formatNumberFull(d.output)}</div>
+            <div style="font-size: 11px; font-weight: 600; opacity: 1;">${formatNumberFull(d.cached)}</div>
             <div style="font-size: 11px; font-weight: 600; opacity: 1;">${formatNumberFull(d.messageCount)}</div>
         </div>
         ${modelBreakdown}
@@ -1807,171 +1518,213 @@ function updateChartRange(range) {
 }
 
 /**
- * Update the stats display in the UI
+ * Update the stats display in the UI (wand popup + extensions drawer)
  */
 function updateUIStats() {
     const stats = getUsageStats();
-    const now = new Date();
 
-    // Today stats
-    $('#token-usage-today-in').text(formatNumberFull(stats.today.input || 0));
-    $('#token-usage-today-out').text(formatNumberFull(stats.today.output || 0));
-    $('#token-usage-today-requests').text(formatNumberFull(stats.today.messageCount || 0));
+    // Stat cards live in the usage popup; update only when it is open
+    const setIf = (id, value) => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = value;
+    };
 
-    // Stats grid
-    $('#token-usage-week-in').text(formatNumberFull(stats.thisWeek.input || 0));
-    $('#token-usage-week-out').text(formatNumberFull(stats.thisWeek.output || 0));
-    $('#token-usage-week-requests').text(formatNumberFull(stats.thisWeek.messageCount || 0));
-    $('#token-usage-month-in').text(formatNumberFull(stats.thisMonth.input || 0));
-    $('#token-usage-month-out').text(formatNumberFull(stats.thisMonth.output || 0));
-    $('#token-usage-month-requests').text(formatNumberFull(stats.thisMonth.messageCount || 0));
-    $('#token-usage-alltime-in').text(formatNumberFull(stats.allTime.input || 0));
-    $('#token-usage-alltime-out').text(formatNumberFull(stats.allTime.output || 0));
-    $('#token-usage-alltime-requests').text(formatNumberFull(stats.allTime.messageCount || 0));
+    setIf('token-usage-today-in', formatNumberFull(stats.today.input || 0));
+    setIf('token-usage-today-out', formatNumberFull(stats.today.output || 0));
+    setIf('token-usage-today-cached', formatNumberFull(stats.today.cached || 0));
+    setIf('token-usage-today-requests', formatNumberFull(stats.today.messageCount || 0));
 
-    // Cost calculations
-    const allTimeCost = calculateAllTimeCost();
-    $('#token-usage-alltime-cost').text(formatCost(allTimeCost));
+    setIf('token-usage-week-in', formatNumberFull(stats.thisWeek.input || 0));
+    setIf('token-usage-week-out', formatNumberFull(stats.thisWeek.output || 0));
+    setIf('token-usage-week-cached', formatNumberFull(stats.thisWeek.cached || 0));
+    setIf('token-usage-week-requests', formatNumberFull(stats.thisWeek.messageCount || 0));
 
-    // For Week/Month: We iterate all `byDay` keys and match those that belong to current week/month
-    const currentWeekKey = getWeekKey(now);
-    const currentMonthKey = getMonthKey(now);
-    const todayKey = getDayKey(now);
+    setIf('token-usage-month-in', formatNumberFull(stats.thisMonth.input || 0));
+    setIf('token-usage-month-out', formatNumberFull(stats.thisMonth.output || 0));
+    setIf('token-usage-month-cached', formatNumberFull(stats.thisMonth.cached || 0));
+    setIf('token-usage-month-requests', formatNumberFull(stats.thisMonth.messageCount || 0));
 
-    let weekCost = 0;
-    let monthCost = 0;
-    let todayCost = 0;
+    setIf('token-usage-alltime-in', formatNumberFull(stats.allTime.input || 0));
+    setIf('token-usage-alltime-out', formatNumberFull(stats.allTime.output || 0));
+    setIf('token-usage-alltime-cached', formatNumberFull(stats.allTime.cached || 0));
+    setIf('token-usage-alltime-requests', formatNumberFull(stats.allTime.messageCount || 0));
 
-    for (const [dayKey, data] of Object.entries(usageRuntime.byDay)) {
-        // Parse dayKey (YYYY-MM-DD) as local date, not UTC
-        // new Date("2026-01-01") interprets as UTC, which shifts timezone
-        const [year, month, day] = dayKey.split('-').map(Number);
-        const date = new Date(year, month - 1, day);
+    setIf('token-usage-tokenizer', 'Tokenizer: ' + (stats.tokenizer || 'Unknown'));
 
-        // Week check
-        if (getWeekKey(date) === currentWeekKey) {
-            // Calculate cost for this day using per-model input/output breakdown
-            if (data.models) {
-                for (const [mid, modelData] of Object.entries(data.models)) {
-                    // modelData is now { input, output, total } (or number for legacy data)
-                    const cost = calculateStoredOrEstimatedCost(modelData, mid);
-                    weekCost += cost || 0;
-                    if (dayKey === todayKey) {
-                        todayCost += cost || 0;
-                    }
-                }
-            }
-        }
-        // Month check
-        if (getMonthKey(date) === currentMonthKey) {
-            if (data.models) {
-                for (const [mid, modelData] of Object.entries(data.models)) {
-                    const cost = calculateStoredOrEstimatedCost(modelData, mid);
-                    monthCost += cost || 0;
-                }
-            }
-        }
-    }
-
-    $('#token-usage-week-cost').text(formatCost(weekCost));
-    $('#token-usage-month-cost').text(formatCost(monthCost));
-    $('#token-usage-today-cost').text(formatCost(todayCost));
-
-    $('#token-usage-tokenizer').text('Tokenizer: ' + (stats.tokenizer || 'Unknown'));
-
-    // Update chart data
+    // Update chart if the popup is open
     chartData = getChartData(currentChartRange);
     renderChart();
 
-    // Update model colors grid
-    renderModelColorsGrid();
+    // Update the per-model token list in the extensions drawer
+    renderModelUsageList();
 }
 
-
 /**
- * Render the model colors grid with price inputs
+ * Render the per-model token counts list in the extensions drawer
+ * (replaces the old colors/prices "Config" section)
  */
-function renderModelColorsGrid() {
-    const grid = $('#token-usage-model-colors-grid');
-    if (grid.length === 0) return;
+function renderModelUsageList() {
+    const grid = document.getElementById('token-usage-model-list');
+    if (!grid) return;
 
-    const stats = getUsageStats();
-    const models = Object.keys(stats.byModel || {}).sort();
+    const byModel = usageRuntime.byModel || {};
+    const models = Object.keys(byModel).sort((a, b) => (byModel[b].total || 0) - (byModel[a].total || 0));
 
     if (models.length === 0) {
-        grid.empty().append('<div style="font-size: 10px; color: var(--SmartThemeBodyColor); opacity: 0.5; padding: 8px; text-align: center;">No models tracked yet</div>');
+        grid.innerHTML = '<div style="font-size: 10px; color: var(--SmartThemeBodyColor); opacity: 0.5; padding: 4px; text-align: center;">No models tracked yet</div>';
         return;
     }
 
-    // If grid is already populated with the same models, don't wipe it (prevents input focus loss)
-    const existingRows = grid.children('.model-config-row');
-    if (existingRows.length === models.length) {
-        // Assume same order check isn't needed for now, unlikely to change order rapidly
-        return;
-    }
-
-    grid.empty();
-
-    const formatPriceForInput = (value) => {
-        if (value === null || value === undefined || Number.isNaN(value)) return '';
-        const numeric = Number(value);
-        if (!Number.isFinite(numeric)) return '';
-        if (numeric > 0 && numeric < 0.001) return '0.001';
-        const rounded = numeric.toFixed(3);
-        if (numeric > 0 && rounded === '0.000') return '0.001';
-        return rounded.replace(/\.?0+$/, '');
-    };
-
-    for (const model of models) {
+    grid.innerHTML = models.map((model) => {
+        const data = byModel[model] || {};
         const color = getModelColor(model);
-        const prices = getModelPrice(model);
-        const inputValue = formatPriceForInput(prices.in);
-        const outputValue = formatPriceForInput(prices.out);
-
-        const row = $(`
-            <div class="model-config-row" style="display: flex; align-items: center; gap: 4px; min-width: 0;">
-                <input type="color" value="${color}" data-model="${model}"
-                       class="model-color-picker"
-                       style="width: 20px; height: 20px; padding: 0; border: none; cursor: pointer; flex-shrink: 0; border-radius: 4px;">
-                <span title="${model}" style="font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--SmartThemeBodyColor); flex: 1;">${model}</span>
-                <span style="font-size: 8px; color: var(--SmartThemeBodyColor); opacity: 0.5; flex-shrink: 0;">Price</span>
-                <input type="number" class="price-input-in" data-model="${model}" value="${inputValue}" step="0.001" min="0" placeholder="In" title="Price per 1M input tokens" style="width: 32px; padding: 1px 2px; font-size: 8px; border-radius: 2px; border: 1px solid var(--SmartThemeBorderColor); background: var(--SmartThemeInputColor); color: var(--SmartThemeBodyColor); flex-shrink: 0;">
-                <input type="number" class="price-input-out" data-model="${model}" value="${outputValue}" step="0.001" min="0" placeholder="Out" title="Price per 1M output tokens" style="width: 32px; padding: 1px 2px; font-size: 8px; border-radius: 2px; border: 1px solid var(--SmartThemeBorderColor); background: var(--SmartThemeInputColor); color: var(--SmartThemeBodyColor); flex-shrink: 0;">
+        const cached = data.cached || 0;
+        const cachedTip = (data.cacheWrite || 0) > 0 ? ` (+${formatNumberFull(data.cacheWrite)} cache write)` : '';
+        return `
+            <div class="token-usage-model-row" style="display: flex; align-items: center; gap: 4px; min-width: 0;">
+                <span style="display: inline-block; width: 7px; height: 7px; background: ${color}; border-radius: 2px; flex-shrink: 0;"></span>
+                <span title="${model}" style="font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--SmartThemeBodyColor); flex: 1; min-width: 0;">${model}</span>
+                <span title="In | Out | Cached | Requests" style="font-size: 10px; color: var(--SmartThemeBodyColor); opacity: 0.75; white-space: nowrap; flex-shrink: 0;">
+                    ${formatTokens(data.input || 0)} | ${formatTokens(data.output || 0)} | <span title="Cache-read tokens${cachedTip ? ' (plus cache writes)' : ''}: ${formatNumberFull(cached)}${cachedTip}">${formatTokens(cached)}</span> | ${formatTokens(data.messageCount || 0)}
+                </span>
             </div>
-        `);
+        `;
+    }).join('');
+}
 
-        // Color picker handler
-        row.find('.model-color-picker').on('change', function () {
-            setModelColor(String($(this).data('model')), String($(this).val()));
-            renderChart();
+// ============================================================
+// Usage popup (Extensions wand menu)
+// ============================================================
+
+/** Track whether the usage popup is open, and the tooltip element reference */
+let usagePopupOpen = false;
+
+/**
+ * Build the popup content HTML (chart + stat cards)
+ * @returns {string}
+ */
+function getUsagePopupHtml() {
+    const stats = getUsageStats();
+    return `
+        <div id="token-usage-popup">
+            <div class="token-usage-chart-shell" style="margin-bottom: 12px;">
+                <div class="token-usage-range-controls" style="display: inline-flex; flex-wrap: wrap; justify-content: flex-end;">
+                    <button class="token-usage-range-btn menu_button" data-value="7" style="padding: 4px 10px; font-size: 11px; border-radius: 4px;">7D</button>
+                    <button class="token-usage-range-btn menu_button active" data-value="30" style="padding: 4px 10px; font-size: 11px; border-radius: 4px;">30D</button>
+                    <button class="token-usage-range-btn menu_button" data-value="90" style="padding: 4px 10px; font-size: 11px; border-radius: 4px;">90D</button>
+                    <button class="token-usage-range-btn menu_button" data-value="365" style="padding: 4px 10px; font-size: 11px; border-radius: 4px;">365D</button>
+                </div>
+                <div id="token-usage-chart" style="width: 100%; height: 320px; background: var(--SmartThemeInputColor); border: 1px solid var(--SmartThemeBorderColor); border-radius: 8px; overflow: hidden;"></div>
+            </div>
+            <div class="token-usage-stats-grid" style="display: grid; gap: 6px; margin-bottom: 4px;">
+                ${renderUsageStatCard('Today', 'today', stats.today)}
+                ${renderUsageStatCard('This Week', 'week', stats.thisWeek)}
+                ${renderUsageStatCard('This Month', 'month', stats.thisMonth)}
+                ${renderUsageStatCard('All Time', 'alltime', stats.allTime)}
+            </div>
+        </div>
+    `;
+}
+
+/**
+ * Wire up the chart controls inside an open popup
+ */
+function bindUsagePopupControls() {
+    document.querySelectorAll('.token-usage-range-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            updateChartRange(parseInt(btn.getAttribute('data-value')));
         });
+    });
 
-        // Price input handlers with debounce
-        let debounceTimer;
-        const handlePriceChange = () => {
-            const mId = model; // closure
-            const pIn = row.find('.price-input-in').val();
-            const pOut = row.find('.price-input-out').val();
-            setModelPrice(mId, pIn, pOut);
-            // Trigger UI update to recalc costs
-            updateUIStats();
-        };
-
-        row.find('input[type="number"]').on('input', function () {
-            clearTimeout(debounceTimer);
-            debounceTimer = setTimeout(handlePriceChange, 500);
+    // Re-render the chart when the popup body resizes
+    const chartContainer = document.getElementById('token-usage-chart');
+    if (chartContainer && typeof ResizeObserver !== 'undefined') {
+        const resizeObserver = new ResizeObserver((entries) => {
+            for (const entry of entries) {
+                if (usagePopupOpen) {
+                    renderChart();
+                }
+            }
         });
-
-        grid.append(row);
+        resizeObserver.observe(chartContainer);
     }
+}
+
+/**
+ * Open the usage popup from the Extensions wand menu
+ */
+async function openUsagePopup() {
+    const context = getContext();
+    const { Popup, POPUP_TYPE } = context;
+    if (!Popup) {
+        console.error('[Token Usage Tracker] Popup API not available');
+        return;
+    }
+
+    // Create tooltip element and append to body (not inside popup to avoid layout issues)
+    if (!document.getElementById('token-usage-tooltip')) {
+        const tooltipEl = document.createElement('div');
+        tooltipEl.id = 'token-usage-tooltip';
+        tooltipEl.style.cssText = 'position: fixed; display: none; background: rgba(0,0,0,0.9); color: white; padding: 6px 10px; border-radius: 6px; font-size: 11px; pointer-events: none; z-index: 99999; box-shadow: 0 4px 12px rgba(0,0,0,0.3);';
+        document.body.appendChild(tooltipEl);
+    }
+    tooltip = document.getElementById('token-usage-tooltip');
+
+    usagePopupOpen = true;
+    const popup = new Popup(getUsagePopupHtml(), POPUP_TYPE.DISPLAY, '', {
+        wide: true,
+        allowVerticalScrolling: true,
+        transparent: false,
+        onOpen: () => {
+            bindUsagePopupControls();
+            chartData = getChartData(currentChartRange);
+            updateChartRange(currentChartRange);
+            updateUIStats();
+        },
+        onClose: () => {
+            usagePopupOpen = false;
+            if (tooltip) {
+                tooltip.style.display = 'none';
+            }
+        },
+    });
+    await popup.show();
+}
+
+/**
+ * Add an "Open Token Usage" entry to the Extensions wand dropdown
+ * (#extensionsMenu). ST reveals the wand button once the menu has any
+ * visible children, so we just need to append one. The menu is appended
+ * to <body> after third-party extension scripts load, so retry briefly.
+ */
+function initWandMenuButton() {
+    const menu = document.getElementById('extensionsMenu');
+    if (!menu) {
+        if ((initWandMenuButton._tries = (initWandMenuButton._tries || 0) + 1) <= 25) {
+            setTimeout(initWandMenuButton, 200);
+        }
+        return;
+    }
+    if (menu.querySelector('#token-usage-wand-open')) return; // idempotent
+
+    const item = document.createElement('div');
+    item.id = 'token-usage-wand-open';
+    item.className = 'list-group-item flex-container flexGap5';
+    item.setAttribute('title', 'Open Token Usage statistics');
+    item.innerHTML = '<div class="fa-solid fa-chart-column extensionsMenuExtensionButton"></div><span>Token Usage</span>';
+    item.addEventListener('click', () => {
+        $('#extensionsMenu').fadeOut(150);
+        openUsagePopup();
+    });
+    menu.appendChild(item);
 }
 
 /**
  * Create the settings UI in the extensions panel
+ * Kept minimal: per-model token counts + controls. The chart and stat
+ * cards live in the wand-menu popup instead.
  */
 function createSettingsUI() {
-    const stats = getUsageStats();
-
     const html = `
         <div id="token_usage_tracker_container" class="extension_container">
             <div class="inline-drawer">
@@ -1980,40 +1733,16 @@ function createSettingsUI() {
                     <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
                 </div>
                 <div class="inline-drawer-content">
-                    <!-- Chart -->
-                    <div class="token-usage-chart-shell" style="margin-bottom: 12px;">
-                        <div class="token-usage-range-controls" style="display: inline-flex; flex-wrap: wrap; justify-content: flex-end;">
-                            <button class="token-usage-range-btn menu_button" data-value="7" style="padding: 4px 10px; font-size: 11px; border-radius: 4px;">7D</button>
-                            <button class="token-usage-range-btn menu_button active" data-value="30" style="padding: 4px 10px; font-size: 11px; border-radius: 4px;">30D</button>
-                            <button class="token-usage-range-btn menu_button" data-value="90" style="padding: 4px 10px; font-size: 11px; border-radius: 4px;">90D</button>
-                            <button class="token-usage-range-btn menu_button" data-value="365" style="padding: 4px 10px; font-size: 11px; border-radius: 4px;">365D</button>
-                        </div>
-                        <div id="token-usage-chart" style="width: 100%; height: 320px; background: var(--SmartThemeInputColor); border: 1px solid var(--SmartThemeBorderColor); border-radius: 8px; overflow: hidden;"></div>
-                    </div>
-
-                    <!-- Stats Grid (Today, Week, Month, All Time) -->
-                    <div class="token-usage-stats-grid" style="display: grid; gap: 6px; margin-bottom: 10px;">
-                        ${renderUsageStatCard('Today', 'today', stats.today)}
-                        ${renderUsageStatCard('This Week', 'week', stats.thisWeek)}
-                        ${renderUsageStatCard('This Month', 'month', stats.thisMonth)}
-                        ${renderUsageStatCard('All Time', 'alltime', stats.allTime)}
-                    </div>
-
-                    <!-- Config (Model Colors & Prices) -->
-                    <div class="inline-drawer" style="margin-top: 10px;">
-                        <div class="inline-drawer-toggle inline-drawer-header" style="padding: 4px 0 4px 8px;">
-                            <span style="font-size: 11px;">Config</span>
-                            <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
-                        </div>
-                        <div class="inline-drawer-content">
-                            <div id="token-usage-model-colors-grid" style="display: grid; grid-template-columns: 1fr 1fr; gap: 4px;"></div>
-                        </div>
-                    </div>
+                    <!-- Per-model token counts (replaces the old Config section) -->
+                    <div id="token-usage-model-list" style="display: grid; grid-template-columns: 1fr; gap: 3px; margin-bottom: 8px;"></div>
 
                     <!-- Controls -->
-                    <div style="display: flex; align-items: center; gap: 8px; padding-left: 8px;">
-                        <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.4;" id="token-usage-tokenizer">Tokenizer: ${stats.tokenizer || 'Unknown'}</div>
+                    <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+                        <div style="font-size: 9px; color: var(--SmartThemeBodyColor); opacity: 0.4;" id="token-usage-tokenizer">Tokenizer: Unknown</div>
                         <div style="flex: 1;"></div>
+                        <div id="token-usage-open-popup" class="menu_button" title="Open the usage chart and stats" style="color: var(--SmartThemeBodyColor); opacity: 0.8; font-size: 11px; white-space: nowrap;">
+                            <i class="fa-solid fa-chart-column"></i>&nbsp;Stats
+                        </div>
                         <div id="token-usage-export" class="menu_button" title="Download all usage data as CSV" style="color: var(--SmartThemeBodyColor); opacity: 0.8; font-size: 11px; white-space: nowrap;">
                             <i class="fa-solid fa-download"></i>&nbsp;Export
                         </div>
@@ -2038,27 +1767,7 @@ function createSettingsUI() {
         }
     }
 
-    // Create tooltip element and append to body (not inside extension container to avoid layout issues)
-    if (!document.getElementById('token-usage-tooltip')) {
-        const tooltipEl = document.createElement('div');
-        tooltipEl.id = 'token-usage-tooltip';
-        tooltipEl.style.cssText = 'position: fixed; display: none; background: rgba(0,0,0,0.9); color: white; padding: 6px 10px; border-radius: 6px; font-size: 11px; pointer-events: none; z-index: 9999; box-shadow: 0 4px 12px rgba(0,0,0,0.3);';
-        document.body.appendChild(tooltipEl);
-        console.log('[Token Usage Tracker] Tooltip appended to body');
-    }
-    tooltip = document.getElementById('token-usage-tooltip');
-
-    // Initialize chart
-    chartData = getChartData(currentChartRange);
-    setTimeout(renderChart, 100);
-
-    // Range button handlers
-    document.querySelectorAll('.token-usage-range-btn').forEach(btn => {
-        btn.addEventListener('click', () => {
-            updateChartRange(parseInt(btn.getAttribute('data-value')));
-        });
-    });
-
+    $('#token-usage-open-popup').on('click', openUsagePopup);
     $('#token-usage-export').on('click', exportUsageCsv);
 
     $('#token-usage-reset-all').on('click', function () {
@@ -2069,31 +1778,21 @@ function createSettingsUI() {
         }
     });
 
+    // Wand menu entry (opens the same popup from the extensions menu)
+    initWandMenuButton();
+
+    // Initial render of the model list
+    renderModelUsageList();
+
     // Subscribe to updates
     eventSource.on('tokenUsageUpdated', updateUIStats);
 
-    // Handle container resize with ResizeObserver (handles panel width changes)
-    const chartContainer = document.getElementById('token-usage-chart');
-    if (chartContainer && typeof ResizeObserver !== 'undefined') {
-        let lastWidth = 0;
-        const resizeObserver = new ResizeObserver((entries) => {
-            for (const entry of entries) {
-                const newWidth = entry.contentRect.width;
-                // Only re-render if width actually changed
-                if (Math.abs(newWidth - lastWidth) > 5) {
-                    lastWidth = newWidth;
-                    renderChart();
-                }
-            }
-        });
-        resizeObserver.observe(chartContainer);
-    }
-
-    // Fallback: window resize
-    let resizeTimeout;
+    // Fallback: window resize re-renders the chart if the popup is open
     window.addEventListener('resize', () => {
-        clearTimeout(resizeTimeout);
-        resizeTimeout = setTimeout(renderChart, 100);
+        clearTimeout(createSettingsUI._resizeTimeout);
+        createSettingsUI._resizeTimeout = setTimeout(() => {
+            if (usagePopupOpen) renderChart();
+        }, 100);
     });
 }
 
@@ -2133,7 +1832,7 @@ async function flushQuietGeneration() {
     if (!pendingInputTokensPromise) return;
 
     try {
-        const inputTokens = await pendingInputTokensPromise;
+        let inputTokens = await pendingInputTokensPromise;
         const modelId = pendingModelId;
 
         // Try to get output from streaming processor
@@ -2142,9 +1841,16 @@ async function flushQuietGeneration() {
             outputTokens = await countTokens(streamingProcessor.result);
         }
 
+        // Prefer API-reported usage
+        const captured = await consumeCapturedUsage();
+        if (captured) {
+            inputTokens = captured.input;
+            outputTokens = captured.output || outputTokens;
+        }
+
         // Record the usage
         if (inputTokens > 0 || outputTokens > 0) {
-            recordUsage(inputTokens, outputTokens, null, modelId);
+            recordUsage(inputTokens, outputTokens, null, modelId, captured);
         }
     } catch (e) {
         console.error('[Token Usage Tracker] Error flushing quiet generation:', e);
@@ -2198,8 +1904,13 @@ function patchConnectionManager() {
                             outputTokens = await countTokens(result);
                         }
 
+                        // Prefer API-reported usage from the underlying request
+                        const captured = await consumeCapturedUsage();
+                        if (captured?.input) inputTokens = captured.input;
+                        if (captured?.output) outputTokens = captured.output;
+
                         if (outputTokens > 0 || inputTokens > 0) {
-                            recordUsage(inputTokens, outputTokens, null, modelId);
+                            recordUsage(inputTokens, outputTokens, null, modelId, captured);
                         }
                     } catch (e) {
                         console.error('[Token Usage Tracker] Error counting sendRequest output:', e);
@@ -2272,6 +1983,9 @@ jQuery(async () => {
     loadSettings();
     registerSlashCommands();
     createSettingsUI();
+
+    // Capture API-reported usage (including cache tokens) from generate responses
+    installUsageCapture();
 
     // Attempt to patch background generation functions
     patchBackgroundGenerations();

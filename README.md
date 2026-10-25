@@ -1,8 +1,6 @@
 # Token Usage Tracker
 
-![Extension Screenshot](1.jpg)
-
-A SillyTavern extension that tracks and visualizes token usage and price for your chats.
+A SillyTavern extension that tracks and visualizes token usage for your chats.
 
 ## Installation
 
@@ -10,20 +8,36 @@ A SillyTavern extension that tracks and visualizes token usage and price for you
 2.  Click on **Install Extension**.
 3.  Paste the repository URL into the "Extension URL" field:
     ```
-    https://github.com/Vibecoder9000/Extension-TokenUsage
+    https://github.com/eteitaxiv/Extension-TokenUsage
     ```
 4.  Click **Install for all users** or **Install just for me**.
 
 ## Usage
 
-Once installed, the extension will automatically start tracking token usage. The GUI will be in the extensions menu.
+The extensions panel keeps a compact drawer with per-model token counts
+(input / output / cached / requests). The full usage chart and the
+today/week/month/all-time stats open as a popup from the **Extensions wand
+menu** (magic wand icon → "Token Usage") or via the **Stats** button in the
+extension drawer.
 
 ## Features
 
- - Automatic pricing derived from Openrouter, accounting for cache hit rate, provider usage share, and model varient matching.
-    - Manual pricing is also an option.
- - Per day, week, month, and all time tokens in, tokens out, requests total, and cost.
+ - Token tracking only — no pricing, no costs. Prices vary per provider and
+   are meaningless for subscription or local/open-source model usage.
+ - API-reported usage capture: SillyTavern discards the `usage` objects that
+   providers attach to generation responses, so this extension captures them
+   itself and records exact input/output token counts when available
+   (OpenAI-compatible, Anthropic, and Gemini shapes, incl. proxies like
+   LiteLLM and OpenRouter).
+ - Cache tracking: cache-read (and cache-write) tokens are recorded whenever
+   the provider reports them, and shown in the stat cards, the chart tooltip,
+   the per-model list, and the CSV export.
+ - Fallback to SillyTavern's native tokenizer (async, respects your tokenizer
+   settings) when the provider reports no usage.
+ - Per day, week, month, and all time tokens in, tokens out, cache-read tokens,
+   and request count.
  - Tracks quiet and background requests.
+ - CSV export of the full usage history (one row per day x model).
 
 ## License
 
