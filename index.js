@@ -1626,7 +1626,9 @@ async function openUsagePopup() {
     if (!document.getElementById('token-usage-tooltip')) {
         const tooltipEl = document.createElement('div');
         tooltipEl.id = 'token-usage-tooltip';
-        tooltipEl.style.cssText = 'position: fixed; display: none; background: rgba(0,0,0,0.9); color: white; padding: 6px 10px; border-radius: 6px; font-size: 11px; pointer-events: none; z-index: 99999; box-shadow: 0 4px 12px rgba(0,0,0,0.3);';
+        // SillyTavern popups and their backdrops stack well above 99999, so the
+        // tooltip needs a near-max z-index to float above the open popup.
+        tooltipEl.style.cssText = 'position: fixed; display: none; background: rgba(0,0,0,0.9); color: white; padding: 6px 10px; border-radius: 6px; font-size: 11px; pointer-events: none; z-index: 2147483647; box-shadow: 0 4px 12px rgba(0,0,0,0.3);';
         document.body.appendChild(tooltipEl);
     }
     tooltip = document.getElementById('token-usage-tooltip');
