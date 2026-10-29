@@ -15,7 +15,7 @@ A SillyTavern extension that tracks and visualizes token usage for your chats.
 ## Usage
 
 The extensions panel keeps a compact drawer with per-model token counts
-(input / output / cached / requests). The full usage chart and the
+(input / output / requests). The full usage chart and the
 today/week/month/all-time stats open as a popup from the **Extensions wand
 menu** (magic wand icon → "Token Usage") or via the **Stats** button in the
 extension drawer.
@@ -29,13 +29,9 @@ extension drawer.
    itself and records exact input/output token counts when available
    (OpenAI-compatible, Anthropic, and Gemini shapes, incl. proxies like
    LiteLLM and OpenRouter).
- - Cache tracking: cache-read (and cache-write) tokens are recorded whenever
-   the provider reports them, and shown in the stat cards, the chart tooltip,
-   the per-model list, and the CSV export.
  - Fallback to SillyTavern's native tokenizer (async, respects your tokenizer
    settings) when the provider reports no usage.
- - Per day, week, month, and all time tokens in, tokens out, cache-read tokens,
-   and request count.
+ - Per day, week, month, and all time tokens in, tokens out, and request count.
  - Tracks quiet and background requests.
  - CSV export of the full usage history (one row per day x model).
 

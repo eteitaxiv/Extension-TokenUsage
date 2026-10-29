@@ -12,14 +12,13 @@
  *       {
  *         d: "2026-08-30",                  // day key
  *         i, o, n,                          // input, output, message count
- *         cr, cw,                           // optional: cached (read) tokens, cache write tokens
  *         s: [                              // per-model rows:
- *           [modelIdx, in, out, msgCount, cached?, cacheWrite?]
+ *           [modelIdx, in, out, msgCount]
  *         ]
  *       }
  *     ],
  *     byModel: [                            // all-time per-model aggregates
- *       [modelIdx, in, out, msgCount, cached?, cacheWrite?]
+ *       [modelIdx, in, out, msgCount]
  *     ]
  *   }
  *
@@ -29,8 +28,7 @@
  * contain estimates from the v1 numeric-format migration, while byModel holds
  * the authoritative totals.
  *
- * v3 dropped the v2 cost fields (cost/costedInput/costedOutput) and added
- * cache token tracking.
+ * v3 dropped the v2 cost fields (cost/costedInput/costedOutput).
  */
 
 const V3 = 3;
@@ -45,18 +43,7 @@ export function createEmptyRuntime() {
     };
 }
 
-/**
- * Add cache fields to a deserialized bucket if present in the row.
- * @param {object} bucket
- * @param {number|undefined} cached Cache read tokens
- * @param {number|undefined} cacheWrite Cache write tokens
- */
-function applyCacheFields(bucket, cached, cacheWrite) {
-    if (Number.isFinite(cached)) bucket.cached = cached;
-    if (Number.isFinite(cacheWrite)) bucket.cacheWrite = cacheWrite;
-}
-
-/** Deserialize one [modelIdx, in, out, msgCount, cached?, cw?] row */
+/** Deserialize one [modelIdx, in, out, msgCount] row */
 function rowToBucket(row) {
     const bucket = {
         input: row[1] || 0,
@@ -64,15 +51,12 @@ function rowToBucket(row) {
         total: (row[1] || 0) + (row[2] || 0),
         messageCount: row[3] || 0,
     };
-    applyCacheFields(bucket, row[4], row[5]);
     return bucket;
 }
 
-/** Serialize a runtime bucket to [idx, in, out, msgCount, cached?, cw?] */
+/** Serialize a runtime bucket to [idx, in, out, msgCount] */
 function bucketToRow(idx, bucket) {
-    const row = [idx, bucket.input || 0, bucket.output || 0, bucket.messageCount || 0];
-    if (Number.isFinite(bucket.cached)) row.push(bucket.cached, bucket.cacheWrite || 0);
-    return row;
+    return [idx, bucket.input || 0, bucket.output || 0, bucket.messageCount || 0];
 }
 
 /**
@@ -100,7 +84,6 @@ export function deserializeUsage(compact) {
             messageCount: day.n || 0,
             models: {},
         };
-        applyCacheFields(dayData, day.cr, day.cw);
 
         for (const row of (day.s || [])) {
             const modelId = models[row[0]];
@@ -147,10 +130,6 @@ export function serializeUsage(runtime) {
             o: day.output || 0,
             n: day.messageCount || 0,
         };
-        if (Number.isFinite(day.cached)) {
-            compact.cr = day.cached;
-            compact.cw = day.cacheWrite || 0;
-        }
 
         compact.s = Object.entries(day.models || {}).map(([modelId, modelData]) =>
             bucketToRow(intern(modelId), modelData));
@@ -270,7 +249,7 @@ function csvEscape(value) {
  */
 export function buildUsageCsv(runtime) {
     const byDay = (runtime && runtime.byDay) || {};
-    const lines = ['date,model,input_tokens,output_tokens,cached_tokens,cache_write_tokens,total_tokens,requests'];
+    const lines = ['date,model,input_tokens,output_tokens,total_tokens,requests'];
 
     for (const dayKey of Object.keys(byDay).sort()) {
         const day = byDay[dayKey];
@@ -288,8 +267,6 @@ export function buildUsageCsv(runtime) {
                 csvEscape(modelId),
                 modelData.input || 0,
                 modelData.output || 0,
-                modelData.cached || 0,
-                modelData.cacheWrite || 0,
                 modelData.total != null ? modelData.total : (modelData.input || 0) + (modelData.output || 0),
                 modelData.messageCount || 0,
             ].join(','));
@@ -306,8 +283,6 @@ export function buildUsageCsv(runtime) {
                 '(unattributed)',
                 unattributedInput,
                 unattributedOutput,
-                day.cached || 0,
-                day.cacheWrite || 0,
                 unattributedInput + unattributedOutput,
                 unattributedRequests,
             ].join(','));
