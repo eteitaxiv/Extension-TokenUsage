@@ -1622,16 +1622,18 @@ async function openUsagePopup() {
         return;
     }
 
-    // Create tooltip element and append to body (not inside popup to avoid layout issues)
-    if (!document.getElementById('token-usage-tooltip')) {
-        const tooltipEl = document.createElement('div');
+    // SillyTavern popups are native <dialog> elements shown with showModal(),
+    // which renders them in the browser's top layer — above every page element
+    // regardless of z-index. Only children of the dialog itself can float above
+    // the popup content (the same approach ST uses for toasts inside popups),
+    // so the tooltip is appended to the dialog element, not to <body>.
+    let tooltipEl = document.getElementById('token-usage-tooltip');
+    if (!tooltipEl || !tooltipEl.isConnected) {
+        tooltipEl = document.createElement('div');
         tooltipEl.id = 'token-usage-tooltip';
-        // SillyTavern popups and their backdrops stack well above 99999, so the
-        // tooltip needs a near-max z-index to float above the open popup.
         tooltipEl.style.cssText = 'position: fixed; display: none; background: rgba(0,0,0,0.9); color: white; padding: 6px 10px; border-radius: 6px; font-size: 11px; pointer-events: none; z-index: 2147483647; box-shadow: 0 4px 12px rgba(0,0,0,0.3);';
-        document.body.appendChild(tooltipEl);
     }
-    tooltip = document.getElementById('token-usage-tooltip');
+    tooltip = tooltipEl;
 
     usagePopupOpen = true;
     const popup = new Popup(getUsagePopupHtml(), POPUP_TYPE.DISPLAY, '', {
@@ -1651,6 +1653,13 @@ async function openUsagePopup() {
             }
         },
     });
+
+    // Move the tooltip into the dialog so it renders above the popup content
+    // (the dialog sits in the browser's top layer; body children cannot).
+    if (popup.dlg) {
+        popup.dlg.appendChild(tooltip);
+    }
+
     await popup.show();
 }
 
