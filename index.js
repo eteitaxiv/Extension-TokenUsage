@@ -97,11 +97,14 @@ function getDayKey(date = new Date()) {
  * Get the current week key (YYYY-WNN)
  */
 function getWeekKey(date = new Date()) {
-    const year = date.getFullYear();
-    const startOfYear = new Date(year, 0, 1);
-    const days = Math.floor((date.getTime() - startOfYear.getTime()) / (24 * 60 * 60 * 1000));
-    const weekNumber = Math.ceil((days + startOfYear.getDay() + 1) / 7);
-    return `${year}-W${String(weekNumber).padStart(2, '0')}`;
+    const d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
+    const dayNum = (d.getUTCDay() + 6) % 7;
+    d.setUTCDate(d.getUTCDate() - dayNum + 3);
+    const isoYear = d.getUTCFullYear();
+    const firstThursday = new Date(Date.UTC(isoYear, 0, 4));
+    const firstDayNum = (firstThursday.getUTCDay() + 6) % 7;
+    const week = 1 + Math.round((d.getTime() - (firstThursday.getTime() - firstDayNum * 86400000)) / (7 * 86400000));
+    return `${isoYear}-W${String(week).padStart(2, '0')}`;
 }
 
 /**
