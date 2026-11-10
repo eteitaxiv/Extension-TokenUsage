@@ -94,29 +94,6 @@ function getDayKey(date = new Date()) {
 }
 
 /**
- * Get the current week key (YYYY-WNN)
- */
-function getWeekKey(date = new Date()) {
-    const d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
-    const dayNum = (d.getUTCDay() + 6) % 7;
-    d.setUTCDate(d.getUTCDate() - dayNum + 3);
-    const isoYear = d.getUTCFullYear();
-    const firstThursday = new Date(Date.UTC(isoYear, 0, 4));
-    const firstDayNum = (firstThursday.getUTCDay() + 6) % 7;
-    const week = 1 + Math.round((d.getTime() - (firstThursday.getTime() - firstDayNum * 86400000)) / (7 * 86400000));
-    return `${isoYear}-W${String(week).padStart(2, '0')}`;
-}
-
-/**
- * Get the current month key (YYYY-MM)
- */
-function getMonthKey(date = new Date()) {
-    const year = date.getFullYear();
-    const month = String(date.getMonth() + 1).padStart(2, '0');
-    return `${year}-${month}`;
-}
-
-/**
  * Count tokens using SillyTavern's native tokenizer
  * Uses SillyTavern's asynchronous tokenizer API.
  * @param {string} text - Text to tokenize
@@ -247,8 +224,13 @@ function exportUsageCsv() {
 function getUsageStats() {
     const usage = usageRuntime;
     const now = new Date();
-    const currentWeekKey = getWeekKey(now);
-    const currentMonthKey = getMonthKey(now);
+    const todayKey = getDayKey(now);
+    const weekStart = new Date(now);
+    weekStart.setDate(weekStart.getDate() - 6);
+    const monthStart = new Date(now);
+    monthStart.setDate(monthStart.getDate() - 29);
+    const weekStartKey = getDayKey(weekStart);
+    const monthStartKey = getDayKey(monthStart);
     const thisWeek = { input: 0, output: 0, total: 0, messageCount: 0 };
     const thisMonth = { input: 0, output: 0, total: 0, messageCount: 0 };
 
@@ -261,17 +243,16 @@ function getUsageStats() {
     }
 
     for (const [dayKey, data] of Object.entries(usage.byDay)) {
-        const [year, month, day] = dayKey.split('-').map(Number);
-        const date = new Date(year, month - 1, day);
-
-        if (getWeekKey(date) === currentWeekKey) {
+        // Rolling windows, the way quotas are counted:
+        // "week" = last 7 days (today included), "month" = last 30 days.
+        if (dayKey >= weekStartKey && dayKey <= todayKey) {
             thisWeek.input += data.input || 0;
             thisWeek.output += data.output || 0;
             thisWeek.total += data.total || 0;
             thisWeek.messageCount += data.messageCount || 0;
         }
 
-        if (getMonthKey(date) === currentMonthKey) {
+        if (dayKey >= monthStartKey && dayKey <= todayKey) {
             thisMonth.input += data.input || 0;
             thisMonth.output += data.output || 0;
             thisMonth.total += data.total || 0;
@@ -938,8 +919,8 @@ function registerSlashCommands() {
                 `Tokenizer: ${stats.tokenizer}`,
                 `Session: ${stats.session.total} tokens (${stats.session.input} in, ${stats.session.output} out)`,
                 `Today: ${stats.today.total} tokens`,
-                `This Week: ${stats.thisWeek.total} tokens`,
-                `This Month: ${stats.thisMonth.total} tokens`,
+                `Last 7 Days: ${stats.thisWeek.total} tokens`,
+                `Last 30 Days: ${stats.thisMonth.total} tokens`,
                 `All Time: ${stats.allTime.total} tokens`,
             ].join('\n');
             return output;
@@ -1582,8 +1563,8 @@ function getUsagePopupHtml() {
             </div>
             <div class="token-usage-stats-grid" style="display: grid; gap: 6px; margin-bottom: 4px;">
                 ${renderUsageStatCard('Today', 'today', stats.today)}
-                ${renderUsageStatCard('This Week', 'week', stats.thisWeek)}
-                ${renderUsageStatCard('This Month', 'month', stats.thisMonth)}
+                ${renderUsageStatCard('Last 7 Days', 'week', stats.thisWeek)}
+                ${renderUsageStatCard('Last 30 Days', 'month', stats.thisMonth)}
                 ${renderUsageStatCard('All Time', 'alltime', stats.allTime)}
             </div>
         </div>
